@@ -1,0 +1,460 @@
+"""Database, accounts and calculation layer for the Branch KPI web app.
+
+No Streamlit code in this file, so it can be tested on its own.
+
+Database: PostgreSQL when DATABASE_URL is set, otherwise a local SQLite file (for trying it on a PC).
+Rules:
+  Adjusted Value = Metric Value x multiplier
+  Branches are ranked by total Adjusted Value for the period. Rank 1 is the highest.
+  A missing entry means "not submitted". A 0 is a real reported value.
+"""
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import sqlite3
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+
+BASE = Path(__file__).parent
+DATA_DIR = BASE / "data"
+SQLITE_PATH = Path(os.environ.get("KPI_DB", BASE / "kpi.db"))
+ROLES = ("branch", "manager", "owner")
+MIN_PASSWORD = 8
+HASH_ROUNDS = 200_000
+
+
+# ---------------------------------------------------------------- connection
+class DB:
+    """Small wrapper so the same code runs on PostgreSQL and SQLite."""
+
+    def __init__(self, url=None):
+        self.url = url or ""
+        self.is_pg = self.url.startswith(("postgres://", "postgresql://"))
+        self.raw = None
+        self.connect()
+
+    def connect(self):
+        if self.is_pg:
+            import psycopg2  # only needed for PostgreSQL
+            self.raw = psycopg2.connect(self.url)
+        else:
+            self.raw = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+
+    def _sql(self, sql):
+        return sql.replace("?", "%s") if self.is_pg else sql
+
+    def _cursor(self):
+        """Return a cursor. Reconnect once if a hosted database closed the idle connection."""
+        if self.is_pg:
+            try:
+                cur = self.raw.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchall()
+                return cur
+            except Exception:
+                try:
+                    self.raw.close()
+                except Exception:
+                    pass
+                self.connect()
+        return self.raw.cursor()
+
+    def query(self, sql, params=()):
+        """Run a SELECT and return a DataFrame (with column names even when empty)."""
+        cur = self._cursor()
+        try:
+            cur.execute(self._sql(sql), tuple(params))
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            self.raw.commit()
+        except Exception:
+            self.raw.rollback()
+            raise
+        return pd.DataFrame(rows, columns=cols)
+
+    def one(self, sql, params=()):
+        df = self.query(sql, params)
+        return None if df.empty else df.iloc[0].tolist()
+
+    def run(self, statements):
+        """Run a list of (sql, params) in one transaction. Returns the row count of each."""
+        cur = self._cursor()
+        counts = []
+        try:
+            for sql, params in statements:
+                cur.execute(self._sql(sql), tuple(params))
+                counts.append(cur.rowcount)
+            self.raw.commit()
+        except Exception:
+            self.raw.rollback()
+            raise
+        return counts
+
+    def insert_many(self, table, columns, rows, chunk=1000):
+        """Insert many rows with a few large statements (fast on a remote database)."""
+        if not self.is_pg:
+            chunk = max(1, 900 // len(columns))   # stay under SQLite's variable limit
+        one = "(" + ",".join("?" * len(columns)) + ")"
+        for i in range(0, len(rows), chunk):
+            part = rows[i:i + chunk]
+            sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES " + ",".join([one] * len(part))
+            self.run([(sql, [v for r in part for v in r])])
+
+
+def connect(url=None):
+    return DB(url if url is not None else os.environ.get("DATABASE_URL", ""))
+
+
+def now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- schema
+def schema(is_pg):
+    d, num = ("DATE", "DOUBLE PRECISION") if is_pg else ("TEXT", "REAL")
+    return [
+        "CREATE TABLE IF NOT EXISTS branches (branch_code TEXT PRIMARY KEY, branch TEXT NOT NULL)",
+        f"CREATE TABLE IF NOT EXISTS metrics (metric TEXT PRIMARY KEY, multiplier {num} NOT NULL)",
+        f"""CREATE TABLE IF NOT EXISTS entries (
+            branch_code TEXT NOT NULL REFERENCES branches(branch_code),
+            date {d} NOT NULL,
+            metric TEXT NOT NULL REFERENCES metrics(metric),
+            value {num} NOT NULL CHECK (value >= 0),
+            updated_at TEXT, updated_by TEXT,
+            PRIMARY KEY (branch_code, date, metric))""",
+        """CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('branch','manager','owner')),
+            branch_code TEXT REFERENCES branches(branch_code),
+            must_change INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT)""",
+        "CREATE TABLE IF NOT EXISTS audit_log (at TEXT, username TEXT, action TEXT, detail TEXT)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_date ON entries (date)",
+    ]
+
+
+def init_db(db, admin_username=None, admin_password=None, load_sample=True):
+    """Create tables. Load reference data, and the sample entries if asked, on first run.
+    Create the first owner account from admin_username and admin_password if no owner exists."""
+    db.run([(s, ()) for s in schema(db.is_pg)])
+    if db.one("SELECT COUNT(*) FROM branches")[0] == 0:
+        b = pd.read_csv(DATA_DIR / "branches.csv")
+        m = pd.read_csv(DATA_DIR / "metrics.csv")
+        db.insert_many("branches", ["branch_code", "branch"], b.values.tolist())
+        db.insert_many("metrics", ["metric", "multiplier"], [[r[0], float(r[1])] for r in m.values.tolist()])
+        if load_sample:
+            e = pd.read_csv(DATA_DIR / "sample_entries.csv")
+            stamp = now()
+            rows = [[r[0], r[1], r[2], float(r[3]), stamp, "sample"] for r in e.values.tolist()]
+            db.insert_many("entries", ["branch_code", "date", "metric", "value", "updated_at", "updated_by"], rows)
+    has_owner = db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0] > 0
+    if not has_owner and admin_username and admin_password:
+        create_user(db, admin_username, "Dashboard owner", "owner", None, admin_password,
+                    by="setup", must_change=False)
+    return db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0] > 0
+
+
+# ---------------------------------------------------------------- accounts
+def _hash(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), HASH_ROUNDS).hex()
+
+
+def check_password_rules(password):
+    if len(password or "") < MIN_PASSWORD:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD} characters.")
+    if password.isdigit() or password.isalpha():
+        raise ValueError("Password must have both letters and numbers.")
+
+
+def new_temp_password():
+    """A random temporary password, shown once to the admin."""
+    words = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    return f"{words}{secrets.randbelow(90) + 10}"
+
+
+def create_user(db, username, full_name, role, branch_code, password, by, must_change=True):
+    username = (username or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,40}", username):
+        raise ValueError("Username: 3 to 40 characters, letters, numbers, dot, dash or underscore.")
+    if role not in ROLES:
+        raise ValueError("Unknown role.")
+    if role == "branch" and not branch_code:
+        raise ValueError("A branch user needs a branch.")
+    if role != "branch":
+        branch_code = None
+    check_password_rules(password)
+    if db.one("SELECT COUNT(*) FROM users WHERE username = ?", (username,))[0]:
+        raise ValueError("That username already exists.")
+    salt = secrets.token_hex(16)
+    db.run([("""INSERT INTO users (username, full_name, password_hash, salt, role, branch_code,
+                                  must_change, active, created_at) VALUES (?,?,?,?,?,?,?,1,?)""",
+             (username, (full_name or username).strip(), _hash(password, salt), salt, role, branch_code,
+              1 if must_change else 0, now()))])
+    log(db, by, "create_user", f"{username} ({role}{' ' + branch_code if branch_code else ''})")
+    return username
+
+
+def check_login(db, username, password):
+    username = (username or "").strip().lower()
+    row = db.one("""SELECT username, full_name, role, branch_code, password_hash, salt, must_change, active
+                    FROM users WHERE username = ?""", (username,))
+    if row and int(row[7]) == 1 and hmac.compare_digest(row[4], _hash(password or "", row[5])):
+        log(db, username, "login")
+        return {"username": row[0], "full_name": row[1], "role": row[2], "branch_code": row[3],
+                "must_change": bool(int(row[6]))}
+    log(db, username or "(blank)", "login_failed")
+    return None
+
+
+def change_password(db, username, old_password, new_password):
+    row = db.one("SELECT password_hash, salt FROM users WHERE username = ? AND active = 1", (username,))
+    if not row or not hmac.compare_digest(row[0], _hash(old_password or "", row[1])):
+        raise ValueError("Current password is wrong.")
+    if new_password == old_password:
+        raise ValueError("The new password must be different.")
+    check_password_rules(new_password)
+    salt = secrets.token_hex(16)
+    db.run([("UPDATE users SET password_hash = ?, salt = ?, must_change = 0 WHERE username = ?",
+             (_hash(new_password, salt), salt, username))])
+    log(db, username, "change_password")
+
+
+def reset_password(db, username, by):
+    """Owner action. Sets a temporary password and returns it. The user must change it at next sign-in."""
+    temp = new_temp_password()
+    salt = secrets.token_hex(16)
+    n = db.run([("UPDATE users SET password_hash = ?, salt = ?, must_change = 1 WHERE username = ?",
+                 (_hash(temp, salt), salt, username))])[0]
+    if n != 1:
+        raise ValueError("User not found.")
+    log(db, by, "reset_password", username)
+    return temp
+
+
+def set_active(db, username, active, by):
+    if not active:
+        row = db.one("SELECT role FROM users WHERE username = ?", (username,))
+        owners = db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0]
+        if row and row[0] == "owner" and owners <= 1:
+            raise ValueError("At least one active owner is required.")
+    db.run([("UPDATE users SET active = ? WHERE username = ?", (1 if active else 0, username))])
+    log(db, by, "activate_user" if active else "deactivate_user", username)
+
+
+def list_users(db):
+    return db.query("""SELECT username, full_name, role, branch_code, must_change, active, created_at
+                       FROM users ORDER BY role, username""")
+
+
+def log(db, username, action, detail=""):
+    db.run([("INSERT INTO audit_log (at, username, action, detail) VALUES (?,?,?,?)",
+             (now(), username, action, detail))])
+
+
+def recent_log(db, limit=50):
+    return db.query(f"SELECT at, username, action, detail FROM audit_log ORDER BY at DESC LIMIT {int(limit)}")
+
+
+# ---------------------------------------------------------------- reads
+def get_branches(db):
+    return db.query("SELECT branch_code, branch FROM branches ORDER BY branch_code")
+
+
+def get_metrics(db):
+    return db.query("SELECT metric, multiplier FROM metrics ORDER BY metric")
+
+
+def load_fact(db):
+    """All entries with branch name, multiplier and Adjusted Value."""
+    df = db.query(
+        """SELECT e.branch_code, b.branch, e.date, e.metric, e.value, m.multiplier,
+                  e.value * m.multiplier AS adjusted
+           FROM entries e
+           JOIN branches b ON b.branch_code = e.branch_code
+           JOIN metrics m ON m.metric = e.metric""")
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ("value", "multiplier", "adjusted"):
+        df[c] = df[c].astype(float)
+    return df
+
+
+def get_day_entries(db, branch_code, day):
+    """The 20 metrics for one branch and day. Value is blank when not entered."""
+    m = get_metrics(db)
+    e = db.query("SELECT metric, value FROM entries WHERE branch_code = ? AND date = ?", (branch_code, str(day)))
+    out = m.merge(e, on="metric", how="left")
+    out["value"] = out["value"].astype(float)
+    return out[["metric", "multiplier", "value"]]
+
+
+# ---------------------------------------------------------------- writes
+def save_day_entries(db, branch_code, day, values, username):
+    """values: dict metric -> number or None. None removes the entry (not submitted).
+    All changes for the day are saved together, or none are."""
+    valid = set(get_metrics(db)["metric"])
+    stamp = now()
+    statements, kinds = [], []
+    for metric, v in values.items():
+        if metric not in valid:
+            raise ValueError(f"Unknown metric: {metric}")
+        if v is None or pd.isna(v):
+            statements.append(("DELETE FROM entries WHERE branch_code = ? AND date = ? AND metric = ?",
+                               (branch_code, str(day), metric)))
+            kinds.append("delete")
+            continue
+        v = float(v)
+        if v < 0 or v != int(v):
+            raise ValueError(f"{metric}: enter a whole number of 0 or higher")
+        statements.append((
+            """INSERT INTO entries (branch_code, date, metric, value, updated_at, updated_by)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT (branch_code, date, metric)
+               DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at,
+                             updated_by = excluded.updated_by""",
+            (branch_code, str(day), metric, v, stamp, username)))
+        kinds.append("save")
+    counts = db.run(statements)
+    saved = kinds.count("save")
+    removed = sum(c for c, kind in zip(counts, kinds) if kind == "delete" and c and c > 0)
+    log(db, username, "save_entries", f"{branch_code} {day}: {saved} saved, {removed} removed")
+    return saved, removed
+
+
+def set_multiplier(db, metric, multiplier, username):
+    old = db.one("SELECT multiplier FROM metrics WHERE metric = ?", (metric,))
+    db.run([("UPDATE metrics SET multiplier = ? WHERE metric = ?", (float(multiplier), metric))])
+    log(db, username, "set_multiplier", f"{metric}: {old[0] if old else None} -> {multiplier}")
+
+
+# ---------------------------------------------------------------- calculations
+def _between(df, start, end):
+    return df[(df["date"] >= pd.Timestamp(start)) & (df["date"] <= pd.Timestamp(end))]
+
+
+def ranking(df, start, end, branches=None):
+    """Adjusted Value and rank per branch for a period. Branches with no data have no rank."""
+    d = _between(df, start, end)
+    g = d.groupby(["branch_code", "branch"], as_index=False).agg(
+        adjusted=("adjusted", "sum"), metric_value=("value", "sum"),
+        days_reported=("date", "nunique"), last_date=("date", "max"))
+    if branches is not None:
+        g = branches.merge(g, on=["branch_code", "branch"], how="left")
+    g["rank"] = g["adjusted"].rank(method="min", ascending=False)
+    total = g["adjusted"].sum()
+    g["share"] = g["adjusted"] / total if total else 0.0
+    g["avg_per_day"] = g["adjusted"] / g["days_reported"]
+    return g.sort_values(["rank", "branch"], na_position="last").reset_index(drop=True)
+
+
+def month_bounds(day):
+    day = pd.Timestamp(day)
+    start = day.replace(day=1)
+    return start, start + pd.offsets.MonthEnd(0)
+
+
+def mtd_compare(df, as_of, branches=None):
+    """Month to date through as_of, against the previous month up to the same day number."""
+    as_of = pd.Timestamp(as_of)
+    cur_start, _ = month_bounds(as_of)
+    prev_start = cur_start - pd.offsets.MonthBegin(1)
+    prev_last = cur_start - timedelta(days=1)
+    prev_end = min(prev_start + timedelta(days=as_of.day - 1), prev_last)
+    cur = ranking(df, cur_start, as_of, branches)
+    prev = ranking(df, prev_start, prev_end, branches)[["branch_code", "adjusted", "rank"]]
+    prev = prev.rename(columns={"adjusted": "prev_adjusted", "rank": "prev_rank"})
+    out = cur.merge(prev, on="branch_code", how="left")
+    out["rank_change"] = out["prev_rank"] - out["rank"]          # positive = moved up
+    out["change_pct"] = (out["adjusted"] - out["prev_adjusted"]) / out["prev_adjusted"]
+    info = {"cur_start": cur_start, "cur_end": as_of, "prev_start": prev_start, "prev_end": prev_end,
+            "cur_total": float(out["adjusted"].sum()), "prev_total": float(out["prev_adjusted"].sum())}
+    info["change_pct"] = (info["cur_total"] - info["prev_total"]) / info["prev_total"] if info["prev_total"] else None
+    return out, info
+
+
+def daily_breakdown(df, start, end, branch_code=None):
+    d = _between(df, start, end)
+    if branch_code:
+        d = d[d["branch_code"] == branch_code]
+    g = d.groupby("date", as_index=False)["adjusted"].sum().sort_values("date")
+    g["running_total"] = g["adjusted"].cumsum()
+    return g
+
+
+def metric_breakdown(df, start, end, branch_code=None):
+    d = _between(df, start, end)
+    if branch_code:
+        d = d[d["branch_code"] == branch_code]
+    g = d.groupby(["metric", "multiplier"], as_index=False).agg(
+        metric_value=("value", "sum"), adjusted=("adjusted", "sum"))
+    total = g["adjusted"].sum()
+    g["share"] = g["adjusted"] / total if total else 0.0
+    return g.sort_values("adjusted", ascending=False).reset_index(drop=True)
+
+
+def submission_check(db, day):
+    """One row per branch: Submitted, Partial or Not submitted for the day."""
+    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics")[0])
+    df = db.query(
+        """SELECT b.branch_code, b.branch, COUNT(e.metric) AS entered
+           FROM branches b
+           LEFT JOIN entries e ON e.branch_code = b.branch_code AND e.date = ?
+           GROUP BY b.branch_code, b.branch ORDER BY b.branch_code""", (str(day),))
+    df["entered"] = df["entered"].astype(int)
+    df["expected"] = n_metrics
+    df["status"] = df["entered"].map(
+        lambda n: "Submitted" if n >= n_metrics else ("Not submitted" if n == 0 else "Partial"))
+    return df
+
+
+def data_quality(db):
+    """Per branch: first and last date, days reported, and a status."""
+    df = db.query(
+        """SELECT b.branch_code, b.branch, MIN(e.date) AS first_date, MAX(e.date) AS last_date,
+                  COUNT(DISTINCT e.date) AS days_reported, COUNT(e.metric) AS entries
+           FROM branches b LEFT JOIN entries e ON e.branch_code = b.branch_code
+           GROUP BY b.branch_code, b.branch ORDER BY b.branch_code""")
+    for c in ("first_date", "last_date"):
+        df[c] = df[c].map(lambda v: None if v is None or pd.isna(v) else str(v)[:10]).astype(object)
+    known = df["last_date"].dropna()
+    latest = known.max() if len(known) else None
+    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics")[0])
+    partial = db.query(
+        """SELECT branch_code, COUNT(*) AS partial_days FROM
+           (SELECT branch_code, date FROM entries GROUP BY branch_code, date HAVING COUNT(*) < ?) p
+           GROUP BY branch_code""", (n_metrics,))
+    df = df.merge(partial, on="branch_code", how="left")
+    df["partial_days"] = df["partial_days"].fillna(0).astype(int)
+
+    def status(r):
+        if r["last_date"] is None or pd.isna(r["last_date"]):
+            return "No data"
+        if r["last_date"] < latest:
+            return "Behind"
+        if r["partial_days"] > 0:
+            return "Partial days"
+        return "OK"
+
+    df["status"] = df.apply(status, axis=1)
+    return df
+
+
+def last_working_day(today=None):
+    d = pd.Timestamp(today or date.today())
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.date()
+
+
+def latest_data_date(df, today=None):
+    """Latest date with data that is not after today."""
+    today = pd.Timestamp(today or date.today())
+    d = df.loc[df["date"] <= today, "date"]
+    return d.max().date() if len(d) else today.date()
