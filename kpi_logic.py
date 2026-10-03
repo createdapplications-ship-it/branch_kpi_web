@@ -25,6 +25,7 @@ SQLITE_PATH = Path(os.environ.get("KPI_DB", BASE / "kpi.db"))
 ROLES = ("branch", "manager", "owner")
 MIN_PASSWORD = 8
 HASH_ROUNDS = 200_000
+SESSION_HOURS = 12
 
 
 # ---------------------------------------------------------------- connection
@@ -137,6 +138,8 @@ def schema(is_pg):
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT)""",
         "CREATE TABLE IF NOT EXISTS audit_log (at TEXT, username TEXT, action TEXT, detail TEXT)",
+        """CREATE TABLE IF NOT EXISTS sessions (
+            token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created_at TEXT, expires_at TEXT NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS idx_entries_date ON entries (date)",
     ]
 
@@ -235,6 +238,7 @@ def reset_password(db, username, by):
                  (_hash(temp, salt), salt, username))])[0]
     if n != 1:
         raise ValueError("User not found.")
+    end_user_sessions(db, username)
     log(db, by, "reset_password", username)
     return temp
 
@@ -246,7 +250,49 @@ def set_active(db, username, active, by):
         if row and row[0] == "owner" and owners <= 1:
             raise ValueError("At least one active owner is required.")
     db.run([("UPDATE users SET active = ? WHERE username = ?", (1 if active else 0, username))])
+    if not active:
+        end_user_sessions(db, username)
     log(db, by, "activate_user" if active else "deactivate_user", username)
+
+
+# ---------------------------------------------------------------- sessions
+# A session keeps a user signed in after a page refresh. The browser holds a random token.
+# Only a hash of the token is stored, and it stops working after SESSION_HOURS or at sign-out.
+def _token_hash(token):
+    return hashlib.sha256((token or "").encode()).hexdigest()
+
+
+def create_session(db, username, hours=SESSION_HOURS):
+    token = secrets.token_urlsafe(32)
+    stamp = datetime.now()
+    db.run([("DELETE FROM sessions WHERE expires_at < ?", (stamp.isoformat(timespec="seconds"),)),
+            ("INSERT INTO sessions (token_hash, username, created_at, expires_at) VALUES (?,?,?,?)",
+             (_token_hash(token), username, stamp.isoformat(timespec="seconds"),
+              (stamp + timedelta(hours=hours)).isoformat(timespec="seconds")))])
+    return token
+
+
+def get_session_user(db, token):
+    """Return the signed-in user for a token, or None if it is unknown, expired or the user is inactive."""
+    if not token or len(token) < 20:
+        return None
+    row = db.one("""SELECT u.username, u.full_name, u.role, u.branch_code, u.must_change
+                    FROM sessions s JOIN users u ON u.username = s.username
+                    WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1""",
+                 (_token_hash(token), now()))
+    if not row:
+        return None
+    return {"username": row[0], "full_name": row[1], "role": row[2], "branch_code": row[3],
+            "must_change": bool(int(row[4]))}
+
+
+def end_session(db, token):
+    if token:
+        db.run([("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))])
+
+
+def end_user_sessions(db, username):
+    db.run([("DELETE FROM sessions WHERE username = ?", (username,))])
 
 
 def list_users(db):
@@ -326,6 +372,103 @@ def save_day_entries(db, branch_code, day, values, username):
     removed = sum(c for c, kind in zip(counts, kinds) if kind == "delete" and c and c > 0)
     log(db, username, "save_entries", f"{branch_code} {day}: {saved} saved, {removed} removed")
     return saved, removed
+
+
+def add_branch(db, branch_code, branch, username):
+    """Add a branch to the branch list (the same two fields as Dim_Branch: Branch Code and Branch Name)."""
+    code = (branch_code or "").strip()
+    name = (branch or "").strip()
+    if not re.fullmatch(r"Branch\d{2,3}", code):
+        raise ValueError("Branch code must look like Branch21 (the word Branch and 2 or 3 digits).")
+    if not name:
+        raise ValueError("Enter the branch name.")
+    existing = get_branches(db)
+    if code.lower() in set(existing["branch_code"].str.lower()):
+        raise ValueError(f"{code} already exists.")
+    if name.lower() in set(existing["branch"].str.lower()):
+        raise ValueError(f"A branch named {name} already exists.")
+    db.run([("INSERT INTO branches (branch_code, branch) VALUES (?,?)", (code, name))])
+    log(db, username, "add_branch", f"{code} {name}")
+    return code
+
+
+def read_branch_file(file, filename):
+    """Read an uploaded branch file (.xlsx with a sheet named data, or .csv) into a DataFrame."""
+    if str(filename).lower().endswith(".csv"):
+        return pd.read_csv(file)
+    try:
+        return pd.read_excel(file, sheet_name="data")
+    except ValueError:
+        raise ValueError('The Excel file needs a sheet named "data".')
+
+
+def check_branch_file(db, raw):
+    """Check an uploaded branch file. Returns (clean rows, list of problems).
+    Needs the columns Date, Metric and Metric Value. Blank values are skipped (not submitted)."""
+    cols = {str(c).strip().lower(): c for c in raw.columns}
+    missing = [n for n in ("date", "metric", "metric value") if n not in cols]
+    if missing:
+        raise ValueError("Missing column(s): " + ", ".join(missing) + ". Needed: Date, Metric, Metric Value.")
+    d = pd.DataFrame({"date": pd.to_datetime(raw[cols["date"]], errors="coerce"),
+                      "metric": raw[cols["metric"]].astype(str).str.strip(),
+                      "value": pd.to_numeric(raw[cols["metric value"]], errors="coerce"),
+                      "raw_value": raw[cols["metric value"]]})
+    problems = []
+    blank = d["raw_value"].isna() | (d["raw_value"].astype(str).str.strip() == "")
+    if blank.sum():
+        problems.append(f"{int(blank.sum())} blank value(s) skipped (treated as not submitted).")
+    d = d[~blank]
+    bad_date = d["date"].isna()
+    if bad_date.sum():
+        problems.append(f"{int(bad_date.sum())} row(s) with an unreadable date skipped.")
+    d = d[~bad_date]
+    valid = set(get_metrics(db)["metric"])
+    unknown = ~d["metric"].isin(valid)
+    if unknown.sum():
+        names = ", ".join(sorted(d.loc[unknown, "metric"].unique())[:5])
+        problems.append(f"{int(unknown.sum())} row(s) with an unknown metric skipped ({names}).")
+    d = d[~unknown]
+    bad_val = d["value"].isna() | (d["value"] < 0) | (d["value"] != d["value"].round())
+    if bad_val.sum():
+        problems.append(f"{int(bad_val.sum())} row(s) skipped: value is not a whole number of 0 or higher.")
+    d = d[~bad_val]
+    future = d["date"] > pd.Timestamp(date.today())
+    if future.sum():
+        problems.append(f"{int(future.sum())} row(s) dated after today. They are imported but check the dates.")
+    dup = d.duplicated(["date", "metric"], keep="first")
+    if dup.sum():
+        problems.append(f"{int(dup.sum())} duplicate Date and Metric row(s) skipped. The first one is kept.")
+    d = d[~dup]
+    d = d.assign(date=d["date"].dt.strftime("%Y-%m-%d"))[["date", "metric", "value"]].reset_index(drop=True)
+    return d, problems
+
+
+def import_entries(db, branch_code, clean, username, chunk=500):
+    """Save checked rows for one branch. Existing entries for the same date and metric are replaced."""
+    if branch_code not in set(get_branches(db)["branch_code"]):
+        raise ValueError("Unknown branch.")
+    before = int(db.one("SELECT COUNT(*) FROM entries WHERE branch_code = ?", (branch_code,))[0])
+    stamp = now()
+    rows = [[branch_code, r[0], r[1], float(r[2]), stamp, username] for r in clean.values.tolist()]
+    if not db.is_pg:
+        chunk = 150
+    one = "(?,?,?,?,?,?)"
+    statements = []
+    for i in range(0, len(rows), chunk):
+        part = rows[i:i + chunk]
+        statements.append((
+            "INSERT INTO entries (branch_code, date, metric, value, updated_at, updated_by) VALUES "
+            + ",".join([one] * len(part))
+            + """ ON CONFLICT (branch_code, date, metric)
+                 DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at,
+                               updated_by = excluded.updated_by""",
+            [v for r in part for v in r]))
+    if statements:
+        db.run(statements)
+    after = int(db.one("SELECT COUNT(*) FROM entries WHERE branch_code = ?", (branch_code,))[0])
+    added = after - before
+    log(db, username, "import_entries", f"{branch_code}: {len(rows)} rows, {added} new, {len(rows) - added} replaced")
+    return {"rows": len(rows), "added": added, "replaced": len(rows) - added}
 
 
 def set_multiplier(db, metric, multiplier, username):

@@ -89,6 +89,9 @@ def login_page():
         user = k.check_login(db, username, password)
         if user:
             st.session_state["user"] = user
+            token = k.create_session(db, user["username"])
+            st.session_state["token"] = token
+            st.query_params["s"] = token      # keeps the sign-in after a page refresh
             st.rerun()
         else:
             st.error("Wrong username or password, or the account is not active.")
@@ -347,6 +350,47 @@ def page_admin(user):
                 k.set_multiplier(db, old["metric"], new["Multiplier"], user["username"])
                 changed += 1
         st.success(f"{changed} multiplier(s) updated.")
+    st.subheader("Branches")
+    fmt_table(k.get_branches(db), {"branch_code": "Branch Code", "branch": "Branch Name"})
+    with st.form("add_branch"):
+        c1, c2 = st.columns(2)
+        new_code = c1.text_input("New branch code (for example Branch21)")
+        new_name = c2.text_input("New branch name (for example Philippines)")
+        add_b = st.form_submit_button("Add branch")
+    if add_b:
+        try:
+            added = k.add_branch(db, new_code, new_name, user["username"])
+            st.success(f"{added} added. Next: create its user on the Users page, then import its file or start entering.")
+        except ValueError as err:
+            st.error(str(err))
+
+    st.subheader("Import a branch file")
+    st.caption('Upload one branch file: .xlsx with a sheet named "data", or .csv. Columns: Date, Metric, Metric Value. '
+               "Entries already saved for the same date and metric are replaced.")
+    branches = k.get_branches(db)
+    code = st.selectbox("Branch for this file", branches["branch_code"], format_func=branch_label(branches),
+                        key="import_branch")
+    up = st.file_uploader("Branch file", type=["xlsx", "csv"], key="import_file")
+    if up is not None:
+        try:
+            clean, problems = k.check_branch_file(db, k.read_branch_file(up, up.name))
+            if up.name.split(".")[0].split("_")[0].lower() != code.lower():
+                st.warning(f"The file name is {up.name} and the selected branch is {code}. Check that they match.")
+            if len(clean):
+                st.write(f"{len(clean):,} rows ready, from {clean['date'].min()} to {clean['date'].max()}, "
+                         f"{clean['date'].nunique()} days.")
+            else:
+                st.error("No usable rows in this file.")
+            for p in problems:
+                st.warning(p)
+            if len(clean) and st.button(f"Import into {code}", key="import_go"):
+                result = k.import_entries(db, code, clean, user["username"])
+                st.success(f"{code}: {result['rows']:,} rows imported. {result['added']:,} new, "
+                           f"{result['replaced']:,} replaced.")
+        except ValueError as err:
+            st.error(str(err))
+        except Exception:
+            st.error("The file could not be read. Check that it is a normal .xlsx or .csv file.")
     st.subheader("Export")
     st.download_button("Download all entries as CSV", k.load_fact(db).to_csv(index=False), "entries.csv", "text/csv")
     st.subheader("Recent activity")
@@ -375,6 +419,17 @@ def main():
         return
     user = st.session_state.get("user")
     if not user:
+        # After a page refresh the browser still has the session token in the address.
+        token = st.query_params.get("s")
+        user = k.get_session_user(db, token) if token else None
+        if user:
+            st.session_state["user"] = user
+            st.session_state["token"] = token
+        elif token:
+            del st.query_params["s"]
+    elif st.session_state.get("token") and st.query_params.get("s") != st.session_state["token"]:
+        st.query_params["s"] = st.session_state["token"]
+    if not user:
         login_page()
         return
     if user.get("must_change"):
@@ -384,8 +439,13 @@ def main():
         st.write(f"Signed in as **{user['full_name']}** ({user['role']})")
         page = st.radio("Go to", PAGES[user["role"]])
         if st.button("Sign out"):
+            k.end_session(db, st.session_state.get("token"))
             st.session_state.pop("user", None)
+            st.session_state.pop("token", None)
+            st.query_params.clear()
             st.rerun()
+        st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "
+                   "Do not share the page address while signed in.")
     PAGE_FUNCS[page](user)
 
 
