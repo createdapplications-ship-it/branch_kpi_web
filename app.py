@@ -1,17 +1,18 @@
-"""Branch KPI web app.
+"""Company portal: Attendance and Branch KPI in one app, with one account per person.
 
 Run on a PC:   streamlit run app.py        (uses a local SQLite file)
 Run hosted:    set DATABASE_URL, ADMIN_USERNAME and ADMIN_PASSWORD as secrets (uses PostgreSQL)
 """
 import os
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
 
 import kpi_logic as k
+import att_logic as a
 
-st.set_page_config(page_title="Branch KPI", layout="wide")
+st.set_page_config(page_title="Company Portal", layout="wide")
 
 
 def cfg(name, default=None):
@@ -33,13 +34,53 @@ def get_db():
 
 
 db, HAS_OWNER = get_db()
+a.TZ_NAME = cfg("APP_TIMEZONE", a.TZ_NAME)
+PORTAL_NAME = cfg("PORTAL_NAME", "Company Portal")
 
-PAGES = {
-    "branch": ["Daily Entry", "My Branch", "My Account"],
-    "manager": ["Main Dashboard", "KPI Dashboard", "Drill-down", "My Account"],
-    "owner": ["Main Dashboard", "KPI Dashboard", "Drill-down", "Submission Check",
-              "Data Quality", "Daily Entry", "Users", "Admin", "My Account"],
+# Data is kept in memory for a short time so each click does not reload every entry from the database.
+# It is cleared straight after any save, import or reference change.
+@st.cache_data(ttl=120, show_spinner=False)
+def fact():
+    return k.load_fact(db)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def branch_list():
+    return k.get_branches(db)
+
+
+def refresh_data():
+    fact.clear()
+    branch_list.clear()
+
+
+KPI_PAGES = {
+    "employee": [],
+    "branch": ["Daily Entry", "My Branch", "My Cluster"],
+    "manager": ["Main Dashboard", "Quarter Ranking", "KPI Dashboard", "Drill-down"],
+    "owner": ["Main Dashboard", "Quarter Ranking", "KPI Dashboard", "Drill-down", "Submission Check",
+              "Data Quality", "Daily Entry", "Admin"],
 }
+ATT_PAGES = {
+    "employee": ["My Attendance"],
+    "branch": ["My Attendance"],
+    "manager": ["My Attendance", "Attendance Today", "Attendance Report"],
+    "owner": ["My Attendance", "Attendance Today", "Attendance Report", "Corrections"],
+}
+
+
+def sections_for(role):
+    """The sections a role can open, and the pages in each."""
+    out = {"Home": ["Home", "My Account"] + (["Users"] if role == "owner" else []),
+           "Attendance": ATT_PAGES[role]}
+    if KPI_PAGES[role]:
+        out["Branch KPI"] = KPI_PAGES[role]
+    return out
+
+
+def go_to(section):
+    st.session_state["dest"] = section
+    st.session_state["section"] = section
 
 
 def fmt_table(df, cols, formats=None):
@@ -55,7 +96,7 @@ def branch_label(branches):
 # ---------------------------------------------------------------- sign-in
 def setup_page():
     """Shown only when no owner account exists yet."""
-    st.title("Branch KPI: first-time setup")
+    st.title("Company Portal: first-time setup")
     if db.is_pg:
         st.error("No owner account exists. Set ADMIN_USERNAME and ADMIN_PASSWORD in the app secrets, "
                  "then restart the app.")
@@ -78,15 +119,39 @@ def setup_page():
             st.error(str(err))
 
 
+def choose(section):
+    st.session_state["dest"] = section
+
+
+def landing_page():
+    """The open main page. No sign-in here. Each link leads to the sign-in page."""
+    st.title(PORTAL_NAME)
+    st.caption("Choose where to go. You sign in with your own username and password.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Attendance")
+        st.write("Time in and time out, and see your own attendance.")
+        st.button("Open Attendance", key="open_att", on_click=choose, args=("Attendance",))
+    with c2:
+        st.subheader("Branch KPI")
+        st.write("Enter daily values and view the rankings and dashboards.")
+        st.button("Open Branch KPI", key="open_kpi", on_click=choose, args=("Branch KPI",))
+
+
 def login_page():
-    st.title("Branch KPI")
-    st.caption("Sign in to enter daily values or view the dashboard.")
+    dest = st.session_state.get("dest", "Home")
+    st.title(f"{dest}: sign in" if dest != "Home" else "Sign in")
+    st.caption("One account works for both Attendance and Branch KPI.")
     with st.form("login"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in")
     if submitted:
-        user = k.check_login(db, username, password)
+        try:
+            user = k.check_login(db, username, password)
+        except ValueError as err:
+            st.error(str(err))
+            return
         if user:
             st.session_state["user"] = user
             token = k.create_session(db, user["username"])
@@ -95,7 +160,8 @@ def login_page():
             st.rerun()
         else:
             st.error("Wrong username or password, or the account is not active.")
-    st.caption("No account? Ask the dashboard owner to create one.")
+    st.caption("No account? Ask the owner to create one.")
+    st.button("Back to the main page", key="back_home", on_click=lambda: st.session_state.pop("dest", None))
 
 
 def password_form(user, forced):
@@ -124,7 +190,7 @@ def password_form(user, forced):
 # ---------------------------------------------------------------- pages
 def page_daily_entry(user):
     st.title("Daily Entry")
-    branches = k.get_branches(db)
+    branches = branch_list()
     if user["role"] == "branch":
         code = user["branch_code"]
     else:
@@ -148,6 +214,7 @@ def page_daily_entry(user):
         try:
             values = dict(zip(edited["Metric"], edited["Metric Value"]))
             saved, removed = k.save_day_entries(db, code, day, values, user["username"])
+            refresh_data()
             st.success(f"Saved {saved} values for {day:%d %b %Y}." + (f" Removed {removed}." if removed else ""))
         except ValueError as err:
             st.error(str(err))
@@ -155,7 +222,7 @@ def page_daily_entry(user):
 
 def page_my_branch(user):
     st.title("My Branch")
-    df = k.load_fact(db)
+    df = fact()
     code = user["branch_code"]
     mine = df[df["branch_code"] == code]
     as_of = k.latest_data_date(mine) if len(mine) else date.today()
@@ -173,10 +240,91 @@ def page_my_branch(user):
               {"Multiplier": "{:.1f}", "Metric Value": "{:,.0f}", "Adjusted Value": "{:,.1f}", "Share": "{:.1%}"})
 
 
+def quarter_table(table, info, with_cluster=True):
+    cols = {"rank": "Program Rank", "cluster_rank": "Cluster Rank", "branch": "Branch"}
+    if with_cluster:
+        cols["cluster"] = "Cluster"
+    cols["adjusted"] = "Adjusted Value, QTD"
+    for mth in info["months"]:
+        cols[mth] = mth
+    cols.update({"days_reported": "Days Reported", "prev_adjusted": info["prev_label"],
+                 "prev_rank": "Previous Rank", "rank_change": "Rank Change"})
+    formats = {"Program Rank": "{:.0f}", "Cluster Rank": "{:.0f}", "Adjusted Value, QTD": "{:,.1f}",
+               "Days Reported": "{:.0f}", info["prev_label"]: "{:,.1f}", "Previous Rank": "{:.0f}",
+               "Rank Change": "{:+.0f}"}
+    formats.update({mth: "{:,.1f}" for mth in info["months"]})
+    fmt_table(table, cols, formats)
+
+
+def page_my_cluster(user):
+    st.title("My Cluster")
+    df = fact()
+    branches = branch_list()
+    row = branches[branches["branch_code"] == user["branch_code"]]
+    if row.empty:
+        st.error("Your account is not linked to a branch. Ask the dashboard owner.")
+        return
+    cluster = row.iloc[0]["cluster"]
+    as_of = st.date_input("As of date", value=k.latest_data_date(df), max_value=date.today())
+    table, info = k.quarter_ranking(df, as_of, branches)
+    view = k.cluster_view(table, cluster)
+    mine = view[view["branch_code"] == user["branch_code"]].iloc[0]
+    clusters = k.cluster_summary(table)
+    crow = clusters[clusters["cluster"] == cluster].iloc[0]
+    st.caption(f"{cluster}, {info['label']} to date: {info['start']:%d %b} to {info['end']:%d %b %Y}. "
+               f"Program Rank is counted across all {info['branches']} branches. "
+               "You see the figures of the branches in your cluster only.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("My Adjusted Value, QTD", f"{mine['adjusted']:,.1f}" if pd.notna(mine["adjusted"]) else "No data")
+    c2.metric("My program rank", f"{mine['rank']:.0f} of {info['ranked']}" if pd.notna(mine["rank"]) else "No data")
+    c3.metric("My rank in the cluster", f"{mine['cluster_rank']:.0f} of {int(crow['reporting'])}"
+              if pd.notna(mine["cluster_rank"]) else "No data")
+    c4.metric("Cluster rank", f"{crow['cluster_rank']:.0f} of {int(clusters['cluster_rank'].notna().sum())}"
+              if pd.notna(crow["cluster_rank"]) else "No data")
+    st.subheader(f"{cluster} branches, {info['label']} to date")
+    quarter_table(view, info, with_cluster=False)
+    have = view.dropna(subset=["rank"])
+    if len(have):
+        st.bar_chart(have.set_index("branch")["adjusted"])
+
+
+def page_quarter_ranking(user):
+    st.title("Quarter Ranking")
+    df = fact()
+    branches = branch_list()
+    c1, c2 = st.columns(2)
+    as_of = c1.date_input("As of date", value=k.latest_data_date(df), max_value=date.today())
+    table, info = k.quarter_ranking(df, as_of, branches)
+    clusters = k.cluster_summary(table)
+    pick = c2.selectbox("Cluster", ["All clusters"] + sorted(table["cluster"].dropna().unique()))
+    st.caption(f"{info['label']} to date: {info['start']:%d %b} to {info['end']:%d %b %Y}. "
+               f"Program Rank is counted across all {info['branches']} branches. "
+               f"Previous figures are for the full {info['prev_label']}.")
+    top = table.dropna(subset=["rank"])
+    topc = clusters.dropna(subset=["cluster_rank"])
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Adjusted Value, QTD", f"{top['adjusted'].sum():,.1f}")
+    m2.metric("Top branch", top.iloc[0]["branch"] if len(top) else "No data")
+    m3.metric("Top cluster", topc.iloc[0]["cluster"] if len(topc) else "No data")
+    m4.metric("Branches reporting", f"{info['ranked']} of {info['branches']}")
+    st.subheader("Clusters")
+    fmt_table(clusters, {"cluster_rank": "Rank", "cluster": "Cluster", "adjusted": "Adjusted Value, QTD",
+                         "share": "Share of Program", "avg_per_branch": "Avg per Branch",
+                         "reporting": "Branches Reporting", "top_branch": "Top Branch", "best_rank": "Best Program Rank"},
+              {"Rank": "{:.0f}", "Adjusted Value, QTD": "{:,.1f}", "Share of Program": "{:.1%}",
+               "Avg per Branch": "{:,.1f}", "Branches Reporting": "{:.0f}", "Best Program Rank": "{:.0f}"})
+    if len(topc):
+        st.bar_chart(topc.set_index("cluster")["adjusted"])
+    st.subheader("Branches" if pick == "All clusters" else f"{pick} branches")
+    view = table if pick == "All clusters" else k.cluster_view(table, pick)
+    quarter_table(view, info)
+    st.download_button("Download quarter ranking as CSV", view.to_csv(index=False), "quarter_ranking.csv", "text/csv")
+
+
 def page_main_dashboard(user):
     st.title("Main Dashboard")
-    df = k.load_fact(db)
-    branches = k.get_branches(db)
+    df = fact()
+    branches = branch_list()
     as_of = st.date_input("As of date", value=k.latest_data_date(df), max_value=date.today())
     table, info = k.mtd_compare(df, as_of, branches)
     st.caption(f"Month to date {info['cur_start']:%d %b} to {info['cur_end']:%d %b %Y}, compared with "
@@ -210,13 +358,14 @@ def page_main_dashboard(user):
 
 def page_kpi_dashboard(user):
     st.title("KPI Dashboard")
-    df = k.load_fact(db)
-    branches = k.get_branches(db)
+    df = fact()
+    branches = branch_list()
     latest = k.latest_data_date(df)
     c1, c2, c3 = st.columns(3)
     start = c1.date_input("From", value=latest.replace(day=1))
     end = c2.date_input("To", value=latest)
     metric = c3.selectbox("Metric", ["All metrics"] + list(k.get_metrics(db)["metric"]))
+    st.caption("Figures refresh within 2 minutes, and at once after you save or import.")
     if start > end:
         st.error("From must be on or before To.")
         return
@@ -241,8 +390,8 @@ def page_kpi_dashboard(user):
 
 def page_drill_down(user):
     st.title("Drill-down")
-    df = k.load_fact(db)
-    branches = k.get_branches(db)
+    df = fact()
+    branches = branch_list()
     latest = k.latest_data_date(df)
     c1, c2, c3 = st.columns(3)
     code = c1.selectbox("Branch", branches["branch_code"], format_func=branch_label(branches))
@@ -290,7 +439,7 @@ def page_data_quality(user):
 
 def page_users(user):
     st.title("Users")
-    branches = k.get_branches(db)
+    branches = branch_list()
     users = k.list_users(db)
     show = users.assign(must_change=users["must_change"].astype(int).map({1: "Yes", 0: "No"}),
                         active=users["active"].astype(int).map({1: "Yes", 0: "No"}))
@@ -302,16 +451,37 @@ def page_users(user):
         c1, c2 = st.columns(2)
         username = c1.text_input("Username (for example branch01 or a name)")
         full_name = c2.text_input("Full name")
-        role = c1.selectbox("Role", list(k.ROLES))
-        code = c2.selectbox("Branch (for the branch role only)", branches["branch_code"], format_func=branch_label(branches))
+        role = c1.selectbox("Role (employee = Attendance only)", list(k.ROLES))
+        code = c2.selectbox("Branch (needed for the branch role, optional for others)",
+                            ["(none)"] + list(branches["branch_code"]))
         add = st.form_submit_button("Create user")
     if add:
         try:
             temp = k.new_temp_password()
-            name = k.create_user(db, username, full_name, role, code if role == "branch" else None, temp,
+            name = k.create_user(db, username, full_name, role, None if code == "(none)" else code, temp,
                                  by=user["username"])
             st.success(f"User {name} created. Temporary password: {temp}")
             st.caption("Give this password to the user. It is shown only once. They must change it at first sign-in.")
+        except ValueError as err:
+            st.error(str(err))
+
+    st.subheader("Add many users from a file")
+    st.caption("Upload a .csv with the columns Username, Full Name, Role, Branch. "
+               "Role is employee, branch, manager or owner. Branch can be blank except for the branch role.")
+    template = "Username,Full Name,Role,Branch\njuan.cruz,Juan Cruz,employee,Branch01\nbranch01,Branch 01 encoder,branch,Branch01\n"
+    st.download_button("Download the user list template", template, "user_list_template.csv", "text/csv")
+    up = st.file_uploader("User list (.csv)", type=["csv"], key="bulk_users")
+    if up is not None and st.button("Create the users in this file", key="bulk_go"):
+        try:
+            created, problems = k.bulk_create_users(db, pd.read_csv(up, dtype=str), by=user["username"])
+            st.success(f"{len(created)} user(s) created. {len(problems)} row(s) skipped.")
+            if len(created):
+                st.dataframe(created, use_container_width=True, hide_index=True)
+                st.download_button("Download the temporary passwords (shown only once)", created.to_csv(index=False),
+                                   "temporary_passwords.csv", "text/csv")
+                st.caption("Hand each password to its user, then delete the downloaded file.")
+            if len(problems):
+                st.dataframe(problems, use_container_width=True, hide_index=True)
         except ValueError as err:
             st.error(str(err))
 
@@ -338,28 +508,66 @@ def page_users(user):
 def page_admin(user):
     st.title("Admin")
     st.caption("Database: " + ("PostgreSQL" if db.is_pg else "local SQLite file"))
-    st.subheader("Multipliers")
+    st.subheader("Metrics and multipliers")
     st.warning("Changing a multiplier changes every past Adjusted Value. Export a copy of the data first.")
     m = k.get_metrics(db)
-    edited = st.data_editor(m.rename(columns={"metric": "Metric", "multiplier": "Multiplier"}),
-                            disabled=["Metric"], hide_index=True, key="mult_editor")
+    view = m.assign(active=m["active"].map({1: "Yes", 0: "No"})).rename(
+        columns={"metric": "Metric", "multiplier": "Multiplier", "active": "Active"})
+    edited = st.data_editor(view, disabled=["Metric", "Active"], hide_index=True, key="mult_editor")
+    st.caption(f"{int((m['active'] == 1).sum())} active metrics. Branches are asked for the active ones only.")
     if st.button("Save multipliers"):
         changed = 0
         for (_, old), (_, new) in zip(m.iterrows(), edited.iterrows()):
             if pd.notna(new["Multiplier"]) and float(new["Multiplier"]) != float(old["multiplier"]):
                 k.set_multiplier(db, old["metric"], new["Multiplier"], user["username"])
                 changed += 1
+        refresh_data()
         st.success(f"{changed} multiplier(s) updated.")
-    st.subheader("Branches")
-    fmt_table(k.get_branches(db), {"branch_code": "Branch Code", "branch": "Branch Name"})
-    with st.form("add_branch"):
+    with st.form("add_metric"):
         c1, c2 = st.columns(2)
+        new_metric = c1.text_input("New metric name")
+        new_mult = c2.text_input("Its multiplier (for example 0.8)")
+        add_m = st.form_submit_button("Add metric")
+    if add_m:
+        try:
+            st.success(f"Metric {k.add_metric(db, new_metric, new_mult, user['username'])} added.")
+        except ValueError as err:
+            st.error(str(err))
+    with st.form("metric_active"):
+        target_m = st.selectbox("Metric to change", list(m["metric"]))
+        action_m = st.radio("Metric action", ["Deactivate metric", "Activate metric"])
+        go_m = st.form_submit_button("Apply to metric")
+    if go_m:
+        try:
+            k.set_metric_active(db, target_m, action_m == "Activate metric", user["username"])
+            st.success(f"{target_m}: done. A deactivated metric keeps its history and is no longer asked for.")
+        except ValueError as err:
+            st.error(str(err))
+
+    st.subheader("Branches")
+    fmt_table(branch_list(), {"branch_code": "Branch Code", "branch": "Branch Name", "cluster": "Cluster"})
+    with st.form("add_branch"):
+        c1, c2, c3 = st.columns(3)
         new_code = c1.text_input("New branch code (for example Branch21)")
         new_name = c2.text_input("New branch name (for example Philippines)")
+        new_cluster = c3.text_input("Cluster (blank = set from the branch number)")
         add_b = st.form_submit_button("Add branch")
+    with st.form("set_cluster"):
+        c1, c2 = st.columns(2)
+        move_code = c1.selectbox("Branch to move", list(branch_list()["branch_code"]))
+        move_to = c2.text_input("Move to cluster (for example Cluster02)")
+        move_b = st.form_submit_button("Change cluster")
+    if move_b:
+        try:
+            k.set_cluster(db, move_code, move_to, user["username"])
+            refresh_data()
+            st.success(f"{move_code} is now in {move_to.strip()}.")
+        except ValueError as err:
+            st.error(str(err))
     if add_b:
         try:
-            added = k.add_branch(db, new_code, new_name, user["username"])
+            added = k.add_branch(db, new_code, new_name, user["username"], new_cluster)
+            refresh_data()
             st.success(f"{added} added. Next: create its user on the Users page, then import its file or start entering.")
         except ValueError as err:
             st.error(str(err))
@@ -367,7 +575,7 @@ def page_admin(user):
     st.subheader("Import a branch file")
     st.caption('Upload one branch file: .xlsx with a sheet named "data", or .csv. Columns: Date, Metric, Metric Value. '
                "Entries already saved for the same date and metric are replaced.")
-    branches = k.get_branches(db)
+    branches = branch_list()
     code = st.selectbox("Branch for this file", branches["branch_code"], format_func=branch_label(branches),
                         key="import_branch")
     up = st.file_uploader("Branch file", type=["xlsx", "csv"], key="import_file")
@@ -385,6 +593,7 @@ def page_admin(user):
                 st.warning(p)
             if len(clean) and st.button(f"Import into {code}", key="import_go"):
                 result = k.import_entries(db, code, clean, user["username"])
+                refresh_data()
                 st.success(f"{code}: {result['rows']:,} rows imported. {result['added']:,} new, "
                            f"{result['replaced']:,} replaced.")
         except ValueError as err:
@@ -392,7 +601,15 @@ def page_admin(user):
         except Exception:
             st.error("The file could not be read. Check that it is a normal .xlsx or .csv file.")
     st.subheader("Export")
-    st.download_button("Download all entries as CSV", k.load_fact(db).to_csv(index=False), "entries.csv", "text/csv")
+    st.download_button("Download all entries as CSV", fact().to_csv(index=False), "entries.csv", "text/csv")
+    st.subheader("Remove sample data")
+    st.caption("Deletes the sample entries loaded when the app first started. Entries typed or imported by users are kept. "
+               "Do this once, before the real branch files are imported.")
+    sure = st.checkbox("I understand this cannot be undone", key="rm_sample_ok")
+    if st.button("Remove sample entries", key="rm_sample") and sure:
+        removed = k.remove_sample_data(db, user["username"])
+        refresh_data()
+        st.success(f"{removed:,} sample entries removed.")
     st.subheader("Recent activity")
     st.dataframe(k.recent_log(db), use_container_width=True, hide_index=True)
 
@@ -405,11 +622,195 @@ def page_my_account(user):
     password_form(user, forced=False)
 
 
+# ---------------------------------------------------------------- home and attendance
+def page_home(user):
+    st.title(PORTAL_NAME)
+    st.write(f"Signed in as **{user['full_name']}**.")
+    secs = sections_for(user["role"])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Attendance")
+        state, rec = a.status(db, user["username"])
+        st.write({"in": "You are timed in.", "out": "You are not timed in.",
+                  "no_time_out": "An earlier time in was never closed."}[state])
+        st.button("Open Attendance", key="home_att", on_click=go_to, args=("Attendance",))
+    with c2:
+        st.subheader("Branch KPI")
+        if "Branch KPI" in secs:
+            st.write("Enter daily values and view the rankings and dashboards.")
+            st.button("Open Branch KPI", key="home_kpi", on_click=go_to, args=("Branch KPI",))
+        else:
+            st.write("Your account does not have Branch KPI access. Ask the owner if you need it.")
+
+
+def _hm(v):
+    return "" if v is None or pd.isna(v) else f"{v:%H:%M}"
+
+
+def att_table(r, with_name=True):
+    t = pd.DataFrame({"Date": r["work_date"]})
+    if with_name:
+        t["Name"] = r["full_name"]
+        t["Branch"] = r["branch_code"]
+    t["Time In"] = [_hm(v) for v in r["in_local"]]
+    t["Time Out"] = [_hm(v) for v in r["out_local"]]
+    t["Hours"] = r["hours"]
+    t["Status"] = r["status"]
+    t["Note"] = r["note"].fillna("")
+    st.dataframe(t.style.format({"Hours": "{:.2f}"}, na_rep=""), use_container_width=True, hide_index=True)
+
+
+def page_my_attendance(user):
+    st.title("My Attendance")
+    name = user["username"]
+    state, rec = a.status(db, name)
+    today = a.local_today()
+    if state == "in":
+        st.success(f"Timed in since {a.to_local(rec['time_in']):%H:%M on %d %b}.")
+    elif state == "no_time_out":
+        st.warning(f"Your time in on {rec['work_date']} was never closed. Ask the owner to correct it. "
+                   "You can still time in for today.")
+    else:
+        st.info("You are not timed in.")
+    c1, c2 = st.columns(2)
+    try:
+        if c1.button("Time In", key="btn_time_in", disabled=state == "in"):
+            a.time_in(db, name)
+            st.rerun()
+        if c2.button("Time Out", key="btn_time_out", disabled=state != "in"):
+            a.time_out(db, name)
+            st.rerun()
+    except ValueError as err:
+        st.error(str(err))
+    st.caption(f"Times are shown in {a.TZ_NAME} time. Today is {today:%a %d %b %Y}.")
+    month = a.records(db, today.replace(day=1), today, username=name)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Days present this month", f"{month['work_date'].nunique()}")
+    m2.metric("Hours this month", f"{month['hours'].sum():.1f}")
+    m3.metric("Hours today", f"{month.loc[month['work_date'] == str(today), 'hours'].sum():.1f}")
+    st.subheader("This month")
+    if len(month):
+        att_table(month.iloc[::-1], with_name=False)
+    else:
+        st.info("No attendance records yet this month.")
+
+
+def page_attendance_today(user):
+    st.title("Attendance Today")
+    branches = branch_list()
+    c1, c2 = st.columns(2)
+    day = c1.date_input("Date", value=a.local_today(), max_value=a.local_today())
+    pick = c2.selectbox("Branch", ["All branches"] + list(branches["branch_code"]))
+    b = a.today_board(db, day)
+    if pick != "All branches":
+        b = b[b["branch_code"] == pick]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("People", f"{len(b)}")
+    m2.metric("In", f"{int((b['status'] == 'In').sum())}")
+    m3.metric("Out", f"{int((b['status'] == 'Out').sum())}")
+    m4.metric("Not in", f"{int((b['status'] == 'Not in').sum())}")
+    t = pd.DataFrame({"Name": b["full_name"], "Branch": b["branch_code"].fillna(""), "Status": b["status"],
+                      "First In": [_hm(v) for v in b["first_in"]], "Last Out": [_hm(v) for v in b["last_out"]],
+                      "Hours": b["hours"]})
+    st.dataframe(t.style.format({"Hours": "{:.2f}"}, na_rep=""), use_container_width=True, hide_index=True)
+    st.caption(f"Times are shown in {a.TZ_NAME} time.")
+
+
+def page_attendance_report(user):
+    st.title("Attendance Report")
+    today = a.local_today()
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", value=today.replace(day=1))
+    end = c2.date_input("To", value=today)
+    if start > end:
+        st.error("From must be on or before To.")
+        return
+    r = a.report(db, start, end)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("People with attendance", f"{int((r['days_present'] > 0).sum())} of {len(r)}")
+    m2.metric("Total hours", f"{r['hours'].sum():,.1f}")
+    m3.metric("Records with no time out", f"{int(r['no_time_out'].sum())}")
+    fmt_table(r, {"full_name": "Name", "branch_code": "Branch", "role": "Role", "days_present": "Days Present",
+                  "hours": "Hours", "avg_hours": "Avg Hours per Day", "no_time_out": "No Time Out"},
+              {"Hours": "{:,.2f}", "Avg Hours per Day": "{:.2f}"})
+    st.download_button("Download the summary as CSV", r.to_csv(index=False), "attendance_summary.csv", "text/csv")
+    detail = a.records(db, start, end)
+    if len(detail):
+        st.subheader("All records")
+        att_table(detail)
+        out = detail[["work_date", "username", "full_name", "branch_code", "in_local", "out_local", "hours",
+                      "status", "note", "edited_by"]]
+        st.download_button("Download all records as CSV", out.to_csv(index=False), "attendance_records.csv", "text/csv")
+
+
+def _parse_time(text, label, required=True):
+    text = (text or "").strip()
+    if not text:
+        if required:
+            raise ValueError(f"Enter the {label} as YYYY-MM-DD HH:MM.")
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise ValueError(f"The {label} must look like 2026-10-05 08:30.")
+
+
+def page_corrections(user):
+    st.title("Corrections")
+    st.caption(f"Fix a record or add a missed one. Every correction needs a reason and is written to the activity log. "
+               f"Times are in {a.TZ_NAME} time.")
+    today = a.local_today()
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", value=today.replace(day=1))
+    end = c2.date_input("To", value=today)
+    r = a.records(db, start, end)
+    st.subheader("Change a record")
+    if r.empty:
+        st.info("No records in this period.")
+    else:
+        att_table(r)
+        labels = {row["id"]: f"{row['work_date']} {row['full_name']} in {_hm(row['in_local'])} "
+                             f"out {_hm(row['out_local']) or 'none'} ({row['status']})" for _, row in r.iterrows()}
+        with st.form("fix_record"):
+            rid = st.selectbox("Record", list(labels), format_func=lambda x: labels[x])
+            f1, f2 = st.columns(2)
+            new_in = f1.text_input("Correct time in (YYYY-MM-DD HH:MM)")
+            new_out = f2.text_input("Correct time out (YYYY-MM-DD HH:MM, blank = still in)")
+            why = st.text_input("Reason for the change")
+            fix = st.form_submit_button("Save correction")
+        if fix:
+            try:
+                a.correct_record(db, rid, _parse_time(new_in, "time in"), _parse_time(new_out, "time out", False),
+                                 why, user["username"])
+                st.success("Record corrected.")
+            except ValueError as err:
+                st.error(str(err))
+    st.subheader("Add a missed record")
+    users = k.list_users(db)
+    with st.form("add_record"):
+        who = st.selectbox("Person", list(users[users["active"].astype(int) == 1]["username"]))
+        g1, g2 = st.columns(2)
+        add_in = g1.text_input("Time in (YYYY-MM-DD HH:MM)")
+        add_out = g2.text_input("Time out (YYYY-MM-DD HH:MM)")
+        add_why = st.text_input("Reason for adding it")
+        add = st.form_submit_button("Add record")
+    if add:
+        try:
+            a.add_record(db, who, _parse_time(add_in, "time in"), _parse_time(add_out, "time out"),
+                         add_why, user["username"])
+            st.success("Record added.")
+        except ValueError as err:
+            st.error(str(err))
+
+
 PAGE_FUNCS = {
+    "Home": page_home, "My Attendance": page_my_attendance, "Attendance Today": page_attendance_today,
+    "Attendance Report": page_attendance_report, "Corrections": page_corrections,
     "Daily Entry": page_daily_entry, "My Branch": page_my_branch, "Main Dashboard": page_main_dashboard,
     "KPI Dashboard": page_kpi_dashboard, "Drill-down": page_drill_down,
     "Submission Check": page_submission_check, "Data Quality": page_data_quality,
     "Users": page_users, "Admin": page_admin, "My Account": page_my_account,
+    "My Cluster": page_my_cluster, "Quarter Ranking": page_quarter_ranking,
 }
 
 
@@ -430,18 +831,28 @@ def main():
     elif st.session_state.get("token") and st.query_params.get("s") != st.session_state["token"]:
         st.query_params["s"] = st.session_state["token"]
     if not user:
-        login_page()
+        if st.session_state.get("dest"):
+            login_page()
+        else:
+            landing_page()
         return
     if user.get("must_change"):
         password_form(user, forced=True)
         return
     with st.sidebar:
         st.write(f"Signed in as **{user['full_name']}** ({user['role']})")
-        page = st.radio("Go to", PAGES[user["role"]])
+        secs = sections_for(user["role"])
+        names = list(secs)
+        dest = st.session_state.get("dest")
+        if st.session_state.get("section") not in names:
+            st.session_state["section"] = dest if dest in names else names[0]
+        section = st.radio("Section", names, key="section")
+        page = st.radio("Go to", secs[section], key="page_" + section)
         if st.button("Sign out"):
             k.end_session(db, st.session_state.get("token"))
             st.session_state.pop("user", None)
             st.session_state.pop("token", None)
+            st.session_state.pop("dest", None)
             st.query_params.clear()
             st.rerun()
         st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "

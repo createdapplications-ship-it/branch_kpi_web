@@ -22,6 +22,25 @@ def raises(name, fn):
 
 ok("row count 56,700", len(df) == 56700 == len(e))
 ok(f"total adjusted {df.adjusted.sum():,.1f} = 158,954.7", abs(df.adjusted.sum() - 158954.7) < 0.05 and abs(e.adj.sum() - df.adjusted.sum()) < 1e-6)
+# clusters and quarter ranking
+ok("20 branches fall into 4 clusters of 5", br.groupby("cluster").size().tolist() == [5, 5, 5, 5] and br.set_index("branch_code").cluster["Branch06"] == "Cluster02")
+last = e["date"].max(); qs = pd.Timestamp(year=last.year, month=3 * ((last.month - 1) // 3) + 1, day=1)
+qt, qi = k.quarter_ranking(df, last, br)
+exp = e[(e.date >= qs) & (e.date <= last)].groupby("branch_code").adj.sum()
+got = qt.set_index("branch_code").adjusted.dropna()
+ok(f"quarter to date totals match an independent sum ({qi['label']})", len(got) == len(exp) and abs(got - exp.reindex(got.index)).max() < 1e-6)
+ok("program rank runs across all branches, 1 is the highest", qt.dropna(subset=["rank"]).adjusted.is_monotonic_decreasing and qt["rank"].min() == 1 and qt["rank"].max() == len(got))
+c1 = k.cluster_view(qt, "Cluster01")
+ok("a cluster view holds only its own branches, with program rank and cluster rank", set(c1.branch_code) == {f"Branch0{i}" for i in range(1, 6)} and c1.cluster_rank.dropna().tolist() == sorted(c1.cluster_rank.dropna()) and c1.cluster_rank.min() == 1 and c1["rank"].max() > 5 - 1)
+cs = k.cluster_summary(qt)
+ok("cluster totals add up to the program total", abs(cs.adjusted.sum() - got.sum()) < 1e-6 and abs(cs.share.sum() - 1) < 1e-9 and cs.cluster_rank.min() == 1)
+ok("month columns add up to the quarter total", abs(qt[qi["months"]].sum(axis=1).sum() - got.sum()) < 1e-6)
+ok("quarter bounds", [str(x.date()) for x in k.quarter_bounds("2026-11-15")] == ["2026-10-01", "2026-12-31"] and k.quarter_label("2026-02-01") == "Q1 2026")
+ok("default cluster from the branch number", k.default_cluster("Branch05") == "Cluster01" and k.default_cluster("Branch21") == "Cluster05")
+k.set_cluster(db, "Branch20", "Cluster01", "owner")
+ok("a branch can be moved to another cluster", k.get_branches(db).set_index("branch_code").cluster["Branch20"] == "Cluster01")
+raises("a badly formed cluster is refused", lambda: k.set_cluster(db, "Branch20", "North", "owner"))
+k.set_cluster(db, "Branch20", "Cluster04", "owner")
 r = k.ranking(df, "2026-01-01", "2026-12-31", br)
 ok(f"rank 1 = {r.iloc[0].branch} (Australia)", r.iloc[0].branch == "Australia")
 ok("rank 15 = Russia", r[r["rank"] == 15].iloc[0].branch == "Russia")
@@ -127,8 +146,67 @@ rk21 = k.ranking(k.load_fact(db), "2026-10-01", "2026-10-02", k.get_branches(db)
 ok("the new branch is ranked once it has entries", pd.notna(rk21.loc["Branch21", "rank"]) and k.submission_check(db, "2026-10-02").set_index("branch_code").loc["Branch21", "status"] == "Submitted")
 k.import_entries(db, "Branch21", clean, "owner")
 ok("a history file can be imported for the new branch", int(db.one("SELECT COUNT(DISTINCT date) FROM entries WHERE branch_code = ?", ("Branch21",))[0]) == clean["date"].nunique())
-lg = k.recent_log(db, 200)
-ok("activity log records sign-ins, failures and user changes", {"login", "login_failed", "create_user", "reset_password", "save_entries", "import_entries"} <= set(lg.action))
+# lockout after wrong passwords
+tl = k.new_temp_password(); k.create_user(db, "locktest", "Lock Test", "manager", None, tl, by="owner")
+for _ in range(k.MAX_FAILED_LOGINS - 1): k.check_login(db, "locktest", "wrong-pass1")
+ok("sign-in still works before the limit is reached", k.check_login(db, "locktest", tl) is not None)
+for _ in range(k.MAX_FAILED_LOGINS): k.check_login(db, "locktest", "wrong-pass1")
+raises("account locks after 5 wrong passwords, even with the right one", lambda: k.check_login(db, "locktest", tl))
+ok("other users are not affected by the lock", k.check_login(db, "owner", "Start1234") is not None)
+tl2 = k.reset_password(db, "locktest", by="owner")
+ok("an owner reset unlocks the account", k.check_login(db, "locktest", tl2) is not None)
+db.run([("UPDATE login_attempts SET at = ? WHERE username = ?", ("2020-01-01T00:00:00", "locktest"))])
+for _ in range(k.MAX_FAILED_LOGINS): k.check_login(db, "locktest", "wrong-pass1")
+db.run([("UPDATE login_attempts SET at = ? WHERE username = ? AND ok = 0", ("2020-01-01T00:00:00", "locktest"))])
+ok("the lock ends by itself after the waiting time", k.check_login(db, "locktest", tl2) is not None)
+
+# metrics: fewer than 20, added and deactivated
+ok("20 metrics, all active at the start", len(k.get_metrics(db)) == 20 and len(k.get_metrics(db, active_only=True)) == 20)
+for mname in ["Cat_016", "Cat_017", "Cat_018", "Cat_019", "Cat_020"]: k.set_metric_active(db, mname, False, "owner")
+ok("after deactivating 5, branches are asked for 15", len(k.get_day_entries(db, "Branch01", "2026-10-02")) == 15)
+sc15 = k.submission_check(db, "2026-09-28")
+ok("Submission Check expects 15 and old full days still count as Submitted", int(sc15["expected"].iloc[0]) == 15 and (sc15.status == "Submitted").sum() == 16)
+ok("history of a deactivated metric stays in the totals", abs(k.load_fact(db)[lambda d: d.branch_code != "Branch21"].adjusted.sum() - 158954.7) < 0.05)
+k.save_day_entries(db, "Branch20", "2026-10-01", {m_: 1 for m_ in k.get_metrics(db, active_only=True)["metric"]}, "owner")
+ok("a day with the 15 active metrics is Submitted", k.submission_check(db, "2026-10-01").set_index("branch_code").loc["Branch20", "status"] == "Submitted")
+ok("and it is not flagged as a partial day", k.data_quality(db).set_index("branch_code").loc["Branch20", "partial_days"] == 0)
+k.add_metric(db, "Customer Visits", "0.8", "owner")
+ok("a new metric can be added with its multiplier", abs(k.get_metrics(db).set_index("metric").loc["Customer Visits", "multiplier"] - 0.8) < 1e-9 and len(k.get_metrics(db, active_only=True)) == 16)
+raises("a duplicate metric name is refused", lambda: k.add_metric(db, "customer visits", 1, "owner"))
+raises("a negative multiplier is refused", lambda: k.add_metric(db, "Bad One", -1, "owner"))
+raises("a multiplier that is not a number is refused", lambda: k.add_metric(db, "Bad Two", "abc", "owner"))
+k.set_metric_active(db, "Customer Visits", False, "owner")
+for mname in ["Cat_016", "Cat_017", "Cat_018", "Cat_019", "Cat_020"]: k.set_metric_active(db, mname, True, "owner")
+ok("metrics can be activated again", len(k.get_metrics(db, active_only=True)) == 20)
+
+# remove sample data, keep real entries
+real_before = int(db.one("SELECT COUNT(*) FROM entries WHERE updated_by <> ?", ("sample",))[0])
+removed_n = k.remove_sample_data(db, "owner")
+ok("sample entries are removed and user entries are kept", removed_n == 56700 and int(db.one("SELECT COUNT(*) FROM entries")[0]) == real_before and real_before > 0)
+db.run([("DELETE FROM entries", ())])   # test only: start from an empty database, as the client will
+jul = pd.DataFrame({"Date": pd.to_datetime(one["date"]), "Metric": one["metric"], "Metric Value": one["value"]})
+jul = jul[(jul.Date >= "2026-07-01") & (jul.Date <= "2026-09-30")]
+cj, pj = k.check_branch_file(db, jul); rj = k.import_entries(db, "Branch01", cj, "owner")
+cmpj, infoj = k.mtd_compare(k.load_fact(db), "2026-09-30", k.get_branches(db))
+ok("July to September can be imported alone and the dashboard works on it", rj["rows"] == len(jul) and infoj["cur_total"] > 0 and infoj["prev_total"] > 0)
+cmpe, infoe = k.mtd_compare(k.load_fact(db), "2026-07-31", k.get_branches(db))
+ok("a month with no earlier history shows no comparison, without an error", infoe["prev_total"] == 0 and infoe["change_pct"] is None)
+
+lg = k.recent_log(db, 5000)
+ok("activity log records sign-ins, failures and user changes", {"login", "login_failed", "login_locked", "create_user", "reset_password", "save_entries", "import_entries", "add_metric", "remove_sample_data"} <= set(lg.action))
 k.set_multiplier(db, "Cat_001", 0.9, "owner"); ok("multiplier change is saved", abs(k.get_metrics(db).set_index("metric").loc["Cat_001", "multiplier"] - 0.9) < 1e-9)
 k.set_multiplier(db, "Cat_001", 0.7, "owner")
+# updating an older database (no active column, no login_attempts table) keeps the data
+if not db.is_pg:
+    import sqlite3, tempfile as _tf
+    oldp = os.path.join(_tf.mkdtemp(), "old.db"); o = sqlite3.connect(oldp)
+    o.executescript("""CREATE TABLE branches (branch_code TEXT PRIMARY KEY, branch TEXT NOT NULL);
+        CREATE TABLE metrics (metric TEXT PRIMARY KEY, multiplier REAL NOT NULL);
+        CREATE TABLE entries (branch_code TEXT NOT NULL, date TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
+            updated_at TEXT, updated_by TEXT, PRIMARY KEY (branch_code, date, metric));
+        INSERT INTO branches VALUES ('Branch01','USA'); INSERT INTO metrics VALUES ('Cat_001',0.7);
+        INSERT INTO entries VALUES ('Branch01','2026-10-01','Cat_001',4,'x','owner');""")
+    o.commit(); o.close()
+    k.SQLITE_PATH = oldp; old = k.connect(""); k.init_db(old, "owner", "Start1234", load_sample=False)
+    ok("an older database is updated in place and keeps its entries", len(k.get_metrics(old, active_only=True)) == 1 and abs(k.load_fact(old).adjusted.sum() - 2.8) < 1e-9 and k.check_login(old, "owner", "Start1234") is not None)
 print(f"\n{sum(res)} of {len(res)} checks passed"); raise SystemExit(0 if all(res) else 1)

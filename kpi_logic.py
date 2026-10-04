@@ -22,10 +22,14 @@ import pandas as pd
 BASE = Path(__file__).parent
 DATA_DIR = BASE / "data"
 SQLITE_PATH = Path(os.environ.get("KPI_DB", BASE / "kpi.db"))
-ROLES = ("branch", "manager", "owner")
+ROLES = ("employee", "branch", "manager", "owner")
+ROLE_CHECK = "role IN ('employee','branch','manager','owner')"
 MIN_PASSWORD = 8
 HASH_ROUNDS = 200_000
 SESSION_HOURS = 12
+CLUSTER_SIZE = 5
+MAX_FAILED_LOGINS = 5
+LOCK_MINUTES = 15
 
 
 # ---------------------------------------------------------------- connection
@@ -127,12 +131,12 @@ def schema(is_pg):
             value {num} NOT NULL CHECK (value >= 0),
             updated_at TEXT, updated_by TEXT,
             PRIMARY KEY (branch_code, date, metric))""",
-        """CREATE TABLE IF NOT EXISTS users (
+        f"""CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             full_name TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('branch','manager','owner')),
+            role TEXT NOT NULL CHECK ({ROLE_CHECK}),
             branch_code TEXT REFERENCES branches(branch_code),
             must_change INTEGER NOT NULL DEFAULT 1,
             active INTEGER NOT NULL DEFAULT 1,
@@ -140,24 +144,64 @@ def schema(is_pg):
         "CREATE TABLE IF NOT EXISTS audit_log (at TEXT, username TEXT, action TEXT, detail TEXT)",
         """CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created_at TEXT, expires_at TEXT NOT NULL)""",
+        "CREATE TABLE IF NOT EXISTS login_attempts (username TEXT NOT NULL, at TEXT NOT NULL, ok INTEGER NOT NULL)",
         "CREATE INDEX IF NOT EXISTS idx_entries_date ON entries (date)",
+        """CREATE TABLE IF NOT EXISTS att_records (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            work_date TEXT NOT NULL,
+            time_in TEXT NOT NULL,
+            time_out TEXT,
+            note TEXT,
+            edited_by TEXT)""",
+        "CREATE INDEX IF NOT EXISTS idx_att_records_date ON att_records (work_date)",
+        "CREATE INDEX IF NOT EXISTS idx_att_records_user ON att_records (username)",
     ]
+
+
+def ensure_column(db, table, column, definition):
+    """Add a column to an existing table if it is missing. Keeps older databases working after an update."""
+    if db.is_pg:
+        db.run([(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}", ())])
+    else:
+        cols = db.query(f"SELECT name FROM pragma_table_info('{table}')")["name"].tolist()
+        if column not in cols:
+            db.run([(f"ALTER TABLE {table} ADD COLUMN {column} {definition}", ())])
+
+
+def migrate_roles(db):
+    """Older databases allow three roles only. Allow the employee role (Attendance only) as well."""
+    if db.is_pg:
+        db.run([("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check", ()),
+                (f"ALTER TABLE users ADD CONSTRAINT users_role_check CHECK ({ROLE_CHECK})", ())])
+        return
+    made = db.one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")[0]
+    if "'employee'" in made:
+        return
+    create = [x for x in schema(False) if "TABLE IF NOT EXISTS users" in x][0]
+    cols = "username, full_name, password_hash, salt, role, branch_code, must_change, active, created_at"
+    db.run([("ALTER TABLE users RENAME TO users_old", ()), (create, ()),
+            (f"INSERT INTO users ({cols}) SELECT {cols} FROM users_old", ()), ("DROP TABLE users_old", ())])
 
 
 def init_db(db, admin_username=None, admin_password=None, load_sample=True):
     """Create tables. Load reference data, and the sample entries if asked, on first run.
     Create the first owner account from admin_username and admin_password if no owner exists."""
     db.run([(s, ()) for s in schema(db.is_pg)])
+    ensure_column(db, "metrics", "active", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(db, "branches", "cluster", "TEXT")
+    migrate_roles(db)
     if db.one("SELECT COUNT(*) FROM branches")[0] == 0:
         b = pd.read_csv(DATA_DIR / "branches.csv")
         m = pd.read_csv(DATA_DIR / "metrics.csv")
-        db.insert_many("branches", ["branch_code", "branch"], b.values.tolist())
+        db.insert_many("branches", ["branch_code", "branch"], b[["branch_code", "branch"]].values.tolist())
         db.insert_many("metrics", ["metric", "multiplier"], [[r[0], float(r[1])] for r in m.values.tolist()])
         if load_sample:
             e = pd.read_csv(DATA_DIR / "sample_entries.csv")
             stamp = now()
             rows = [[r[0], r[1], r[2], float(r[3]), stamp, "sample"] for r in e.values.tolist()]
             db.insert_many("entries", ["branch_code", "date", "metric", "value", "updated_at", "updated_by"], rows)
+    fill_clusters(db)
     has_owner = db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0] > 0
     if not has_owner and admin_username and admin_password:
         create_user(db, admin_username, "Dashboard owner", "owner", None, admin_password,
@@ -191,8 +235,9 @@ def create_user(db, username, full_name, role, branch_code, password, by, must_c
         raise ValueError("Unknown role.")
     if role == "branch" and not branch_code:
         raise ValueError("A branch user needs a branch.")
-    if role != "branch":
-        branch_code = None
+    branch_code = (branch_code or "").strip() or None
+    if branch_code and not db.one("SELECT COUNT(*) FROM branches WHERE branch_code = ?", (branch_code,))[0]:
+        raise ValueError(f"{branch_code} is not in the branch list.")
     check_password_rules(password)
     if db.one("SELECT COUNT(*) FROM users WHERE username = ?", (username,))[0]:
         raise ValueError("That username already exists.")
@@ -205,11 +250,29 @@ def create_user(db, username, full_name, role, branch_code, password, by, must_c
     return username
 
 
+def is_locked(db, username):
+    """True when the account has too many wrong passwords in the last LOCK_MINUTES."""
+    since = (datetime.now() - timedelta(minutes=LOCK_MINUTES)).isoformat(timespec="microseconds")
+    last_ok = db.one("SELECT MAX(at) FROM login_attempts WHERE username = ? AND ok = 1", (username,))[0]
+    start = max(since, last_ok) if last_ok else since
+    failed = db.one("SELECT COUNT(*) FROM login_attempts WHERE username = ? AND ok = 0 AND at > ?",
+                    (username, start))[0]
+    return int(failed) >= MAX_FAILED_LOGINS
+
+
 def check_login(db, username, password):
+    """Return the user for a correct sign-in, or None. Raises ValueError while the account is locked."""
     username = (username or "").strip().lower()
+    if username and is_locked(db, username):
+        log(db, username, "login_locked")
+        raise ValueError(f"Too many wrong passwords. Try again in {LOCK_MINUTES} minutes, "
+                         "or ask the owner to reset your password.")
     row = db.one("""SELECT username, full_name, role, branch_code, password_hash, salt, must_change, active
                     FROM users WHERE username = ?""", (username,))
-    if row and int(row[7]) == 1 and hmac.compare_digest(row[4], _hash(password or "", row[5])):
+    good = bool(row and int(row[7]) == 1 and hmac.compare_digest(row[4], _hash(password or "", row[5])))
+    if username:
+        db.run([("INSERT INTO login_attempts (username, at, ok) VALUES (?,?,?)", (username, datetime.now().isoformat(timespec="microseconds"), 1 if good else 0))])
+    if good:
         log(db, username, "login")
         return {"username": row[0], "full_name": row[1], "role": row[2], "branch_code": row[3],
                 "must_change": bool(int(row[6]))}
@@ -239,6 +302,7 @@ def reset_password(db, username, by):
     if n != 1:
         raise ValueError("User not found.")
     end_user_sessions(db, username)
+    db.run([("DELETE FROM login_attempts WHERE username = ?", (username,))])   # also unlocks the account
     log(db, by, "reset_password", username)
     return temp
 
@@ -266,6 +330,7 @@ def create_session(db, username, hours=SESSION_HOURS):
     token = secrets.token_urlsafe(32)
     stamp = datetime.now()
     db.run([("DELETE FROM sessions WHERE expires_at < ?", (stamp.isoformat(timespec="seconds"),)),
+            ("DELETE FROM login_attempts WHERE at < ?", ((stamp - timedelta(days=1)).isoformat(timespec="seconds"),)),
             ("INSERT INTO sessions (token_hash, username, created_at, expires_at) VALUES (?,?,?,?)",
              (_token_hash(token), username, stamp.isoformat(timespec="seconds"),
               (stamp + timedelta(hours=hours)).isoformat(timespec="seconds")))])
@@ -295,6 +360,32 @@ def end_user_sessions(db, username):
     db.run([("DELETE FROM sessions WHERE username = ?", (username,))])
 
 
+def bulk_create_users(db, table, by):
+    """Create many users from a table with columns Username, Full Name, Role, Branch.
+    Role: employee (Attendance only), branch, manager or owner. Branch may be blank except for the branch role.
+    Returns (created, problems). created holds each new user's temporary password, shown once."""
+    cols = {str(c).strip().lower(): c for c in table.columns}
+    missing = [c for c in ("username", "full name", "role", "branch") if c not in cols]
+    if missing:
+        raise ValueError("Missing column(s): " + ", ".join(c.title() for c in missing))
+    created, problems = [], []
+    for i, r in table.iterrows():
+        def cell(name):
+            v = r[cols[name]]
+            return "" if pd.isna(v) else str(v).strip()
+        if not cell("username"):
+            continue
+        temp = new_temp_password()
+        try:
+            name = create_user(db, cell("username"), cell("full name"), cell("role").lower() or "employee",
+                               cell("branch"), temp, by)
+            created.append({"Username": name, "Full Name": cell("full name"), "Temporary Password": temp})
+        except ValueError as err:
+            problems.append({"Row": i + 2, "Username": cell("username"), "Problem": str(err)})
+    return (pd.DataFrame(created, columns=["Username", "Full Name", "Temporary Password"]),
+            pd.DataFrame(problems, columns=["Row", "Username", "Problem"]))
+
+
 def list_users(db):
     return db.query("""SELECT username, full_name, role, branch_code, must_change, active, created_at
                        FROM users ORDER BY role, username""")
@@ -311,17 +402,82 @@ def recent_log(db, limit=50):
 
 # ---------------------------------------------------------------- reads
 def get_branches(db):
-    return db.query("SELECT branch_code, branch FROM branches ORDER BY branch_code")
+    return db.query("SELECT branch_code, branch, cluster FROM branches ORDER BY branch_code")
 
 
-def get_metrics(db):
-    return db.query("SELECT metric, multiplier FROM metrics ORDER BY metric")
+def default_cluster(branch_code, size=CLUSTER_SIZE):
+    """Branch01 to Branch05 are Cluster01, Branch06 to Branch10 are Cluster02, and so on."""
+    n = int(re.search(r"(\d+)$", branch_code).group(1))
+    return f"Cluster{(n - 1) // size + 1:02d}"
+
+
+def fill_clusters(db):
+    """Give a cluster to any branch that has none. Clusters already set are left alone."""
+    missing = db.query("SELECT branch_code FROM branches WHERE cluster IS NULL OR cluster = ''")
+    if len(missing):
+        db.run([("UPDATE branches SET cluster = ? WHERE branch_code = ?", (default_cluster(c), c))
+                for c in missing["branch_code"]])
+
+
+def set_cluster(db, branch_code, cluster, username):
+    cluster = (cluster or "").strip()
+    if not re.fullmatch(r"Cluster\d{2}", cluster):
+        raise ValueError("Cluster must look like Cluster01 (the word Cluster and 2 digits).")
+    old = db.one("SELECT cluster FROM branches WHERE branch_code = ?", (branch_code,))
+    if not old:
+        raise ValueError(f"{branch_code} does not exist.")
+    db.run([("UPDATE branches SET cluster = ? WHERE branch_code = ?", (cluster, branch_code))])
+    log(db, username, "set_cluster", f"{branch_code}: {old[0]} -> {cluster}")
+
+
+def get_metrics(db, active_only=False):
+    """Metric, multiplier and active flag. Inactive metrics keep their history but are not asked for."""
+    df = db.query("SELECT metric, multiplier, active FROM metrics ORDER BY metric")
+    df["active"] = df["active"].astype(int)
+    df["multiplier"] = df["multiplier"].astype(float)
+    return df[df["active"] == 1].reset_index(drop=True) if active_only else df
+
+
+def add_metric(db, metric, multiplier, username):
+    name = (metric or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.\-/&%]{0,39}", name):
+        raise ValueError("Metric name: 1 to 40 characters, starting with a letter or number.")
+    try:
+        mult = float(multiplier)
+    except (TypeError, ValueError):
+        raise ValueError("Enter the multiplier as a number.")
+    if mult < 0:
+        raise ValueError("The multiplier cannot be negative.")
+    if name.lower() in set(get_metrics(db)["metric"].str.lower()):
+        raise ValueError(f"The metric {name} already exists.")
+    db.run([("INSERT INTO metrics (metric, multiplier, active) VALUES (?,?,1)", (name, mult))])
+    log(db, username, "add_metric", f"{name} x {mult}")
+    return name
+
+
+def set_metric_active(db, metric, active, username):
+    """Deactivate a metric so it is no longer asked for. Its past entries stay in the totals."""
+    if not active:
+        left = int(db.one("SELECT COUNT(*) FROM metrics WHERE active = 1 AND metric <> ?", (metric,))[0])
+        if left < 1:
+            raise ValueError("At least one active metric is required.")
+    n = db.run([("UPDATE metrics SET active = ? WHERE metric = ?", (1 if active else 0, metric))])[0]
+    if n != 1:
+        raise ValueError("Metric not found.")
+    log(db, username, "activate_metric" if active else "deactivate_metric", metric)
+
+
+def remove_sample_data(db, username):
+    """Delete the sample entries loaded at first start. Entries typed or imported by users are kept."""
+    n = db.run([("DELETE FROM entries WHERE updated_by = ?", ("sample",))])[0]
+    log(db, username, "remove_sample_data", f"{n} rows")
+    return n
 
 
 def load_fact(db):
     """All entries with branch name, multiplier and Adjusted Value."""
     df = db.query(
-        """SELECT e.branch_code, b.branch, e.date, e.metric, e.value, m.multiplier,
+        """SELECT e.branch_code, b.branch, b.cluster, e.date, e.metric, e.value, m.multiplier,
                   e.value * m.multiplier AS adjusted
            FROM entries e
            JOIN branches b ON b.branch_code = e.branch_code
@@ -333,8 +489,8 @@ def load_fact(db):
 
 
 def get_day_entries(db, branch_code, day):
-    """The 20 metrics for one branch and day. Value is blank when not entered."""
-    m = get_metrics(db)
+    """The active metrics for one branch and day. Value is blank when not entered."""
+    m = get_metrics(db, active_only=True)
     e = db.query("SELECT metric, value FROM entries WHERE branch_code = ? AND date = ?", (branch_code, str(day)))
     out = m.merge(e, on="metric", how="left")
     out["value"] = out["value"].astype(float)
@@ -374,7 +530,7 @@ def save_day_entries(db, branch_code, day, values, username):
     return saved, removed
 
 
-def add_branch(db, branch_code, branch, username):
+def add_branch(db, branch_code, branch, username, cluster=None):
     """Add a branch to the branch list (the same two fields as Dim_Branch: Branch Code and Branch Name)."""
     code = (branch_code or "").strip()
     name = (branch or "").strip()
@@ -387,8 +543,11 @@ def add_branch(db, branch_code, branch, username):
         raise ValueError(f"{code} already exists.")
     if name.lower() in set(existing["branch"].str.lower()):
         raise ValueError(f"A branch named {name} already exists.")
-    db.run([("INSERT INTO branches (branch_code, branch) VALUES (?,?)", (code, name))])
-    log(db, username, "add_branch", f"{code} {name}")
+    cluster = (cluster or "").strip() or default_cluster(code)
+    if not re.fullmatch(r"Cluster\d{2}", cluster):
+        raise ValueError("Cluster must look like Cluster01 (the word Cluster and 2 digits).")
+    db.run([("INSERT INTO branches (branch_code, branch, cluster) VALUES (?,?,?)", (code, name, cluster))])
+    log(db, username, "add_branch", f"{code} {name} {cluster}")
     return code
 
 
@@ -490,11 +649,71 @@ def ranking(df, start, end, branches=None):
         days_reported=("date", "nunique"), last_date=("date", "max"))
     if branches is not None:
         g = branches.merge(g, on=["branch_code", "branch"], how="left")
+    elif "cluster" in d.columns:
+        g = g.merge(d[["branch_code", "cluster"]].drop_duplicates(), on="branch_code", how="left")
     g["rank"] = g["adjusted"].rank(method="min", ascending=False)
     total = g["adjusted"].sum()
     g["share"] = g["adjusted"] / total if total else 0.0
     g["avg_per_day"] = g["adjusted"] / g["days_reported"]
     return g.sort_values(["rank", "branch"], na_position="last").reset_index(drop=True)
+
+
+def quarter_bounds(day):
+    day = pd.Timestamp(day)
+    start = pd.Timestamp(year=day.year, month=3 * ((day.month - 1) // 3) + 1, day=1)
+    return start, start + pd.offsets.QuarterEnd(0)
+
+
+def quarter_label(day):
+    day = pd.Timestamp(day)
+    return f"Q{(day.month - 1) // 3 + 1} {day.year}"
+
+
+def quarter_ranking(df, as_of, branches):
+    """Quarter to date through as_of, for every branch.
+    rank is across the whole program. cluster_rank is the position inside the branch's own cluster.
+    prev_adjusted and prev_rank are for the full previous quarter."""
+    as_of = pd.Timestamp(as_of)
+    q_start, q_end = quarter_bounds(as_of)
+    p_start, p_end = quarter_bounds(q_start - timedelta(days=1))
+    cur = ranking(df, q_start, as_of, branches)
+    cur["cluster_rank"] = cur.groupby("cluster")["adjusted"].rank(method="min", ascending=False)
+    prev = ranking(df, p_start, p_end, branches)[["branch_code", "adjusted", "rank"]]
+    prev = prev.rename(columns={"adjusted": "prev_adjusted", "rank": "prev_rank"})
+    out = cur.merge(prev, on="branch_code", how="left")
+    out["rank_change"] = out["prev_rank"] - out["rank"]
+    months = _between(df, q_start, as_of).copy()
+    if len(months):
+        months["month"] = months["date"].dt.strftime("%b")
+        order = list(dict.fromkeys(months.sort_values("date")["month"]))
+        piv = months.pivot_table(index="branch_code", columns="month", values="adjusted", aggfunc="sum")[order]
+        out = out.merge(piv.reset_index(), on="branch_code", how="left")
+    else:
+        order = []
+    info = {"label": quarter_label(as_of), "start": q_start, "end": as_of, "quarter_end": q_end,
+            "prev_label": quarter_label(p_start), "months": order,
+            "ranked": int(out["rank"].notna().sum()), "branches": len(out)}
+    return out, info
+
+
+def cluster_summary(table):
+    """One row per cluster from a quarter_ranking table."""
+    g = table.groupby("cluster", as_index=False).agg(
+        branches=("branch_code", "count"), reporting=("rank", "count"),
+        adjusted=("adjusted", "sum"), best_rank=("rank", "min"))
+    g["avg_per_branch"] = g["adjusted"] / g["reporting"].where(g["reporting"] > 0)
+    g.loc[g["reporting"] == 0, "adjusted"] = float("nan")
+    g["cluster_rank"] = g["adjusted"].rank(method="min", ascending=False)
+    total = g["adjusted"].sum()
+    g["share"] = g["adjusted"] / total if total else 0.0
+    top = table.dropna(subset=["rank"]).sort_values("rank").groupby("cluster")["branch"].first()
+    g["top_branch"] = g["cluster"].map(top)
+    return g.sort_values(["cluster_rank", "cluster"], na_position="last").reset_index(drop=True)
+
+
+def cluster_view(table, cluster):
+    """The branches of one cluster, with their program rank and their rank inside the cluster."""
+    return table[table["cluster"] == cluster].sort_values(["rank", "branch"], na_position="last").reset_index(drop=True)
 
 
 def month_bounds(day):
@@ -543,12 +762,13 @@ def metric_breakdown(df, start, end, branch_code=None):
 
 
 def submission_check(db, day):
-    """One row per branch: Submitted, Partial or Not submitted for the day."""
-    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics")[0])
+    """One row per branch: Submitted, Partial or Not submitted for the day. Counts active metrics only."""
+    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics WHERE active = 1")[0])
     df = db.query(
-        """SELECT b.branch_code, b.branch, COUNT(e.metric) AS entered
+        """SELECT b.branch_code, b.branch, COUNT(m.metric) AS entered
            FROM branches b
            LEFT JOIN entries e ON e.branch_code = b.branch_code AND e.date = ?
+           LEFT JOIN metrics m ON m.metric = e.metric AND m.active = 1
            GROUP BY b.branch_code, b.branch ORDER BY b.branch_code""", (str(day),))
     df["entered"] = df["entered"].astype(int)
     df["expected"] = n_metrics
@@ -568,10 +788,12 @@ def data_quality(db):
         df[c] = df[c].map(lambda v: None if v is None or pd.isna(v) else str(v)[:10]).astype(object)
     known = df["last_date"].dropna()
     latest = known.max() if len(known) else None
-    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics")[0])
+    n_metrics = int(db.one("SELECT COUNT(*) FROM metrics WHERE active = 1")[0])
     partial = db.query(
         """SELECT branch_code, COUNT(*) AS partial_days FROM
-           (SELECT branch_code, date FROM entries GROUP BY branch_code, date HAVING COUNT(*) < ?) p
+           (SELECT e.branch_code, e.date FROM entries e
+            JOIN metrics m ON m.metric = e.metric AND m.active = 1
+            GROUP BY e.branch_code, e.date HAVING COUNT(*) < ?) p
            GROUP BY branch_code""", (n_metrics,))
     df = df.merge(partial, on="branch_code", how="left")
     df["partial_days"] = df["partial_days"].fillna(0).astype(int)

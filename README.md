@@ -1,19 +1,57 @@
-# Branch KPI web app (PostgreSQL version with real user accounts)
+# Company Portal: Attendance and Branch KPI in one app
 
-Branches type the daily values into a web form. The values go into a PostgreSQL database.
-The dashboard pages read that database. Entries stay saved when the app restarts.
+One app, one database, one account per person.
 
-Rule: Adjusted Value = Metric Value x multiplier. Branches are ranked by total Adjusted Value.
+- The main page is open to anyone and has two links: Attendance and Branch KPI. It has no sign-in form.
+- Either link leads to the sign-in page. After one sign-in the person can move between the sections they are allowed to open.
+- The owner manages every account on one Users page.
 
-## What changed from the first prototype
+## Roles
 
-- Database: PostgreSQL when `DATABASE_URL` is set. Without it, the app uses a local SQLite file so it can still be tried on a PC.
-- Accounts: no demo logins. The owner creates one account per person on the Users page.
-  Each new user gets a temporary password and must set their own at first sign-in.
-- Passwords are stored hashed with a separate salt per user. Nobody can read them, including the owner.
-- The owner can reset a password and deactivate or reactivate a user.
-- Every sign-in, failed sign-in, save and user change is written to the activity log.
-- A page refresh keeps the user signed in. The sign-in lasts 12 hours or until Sign out. See the section below.
+| Role | Attendance | Branch KPI |
+|---|---|---|
+| employee | Own time in and time out | No access |
+| branch | Own time in and time out | Daily Entry, My Branch, My Cluster |
+| manager | Own, plus Attendance Today and Attendance Report | Dashboards and Quarter Ranking |
+| owner | All of the above, plus Corrections | Everything, plus Admin and Users |
+
+## Attendance rules
+
+- Time In opens a record. Time Out closes it. A person can do this more than once a day, and the hours are added up.
+- Times are stored in UTC and shown in one time zone. Set it with the `APP_TIMEZONE` secret (default `Asia/Manila`).
+- A record still open after 16 hours is flagged "No time out". The person can time in again. Only the owner can correct the old record.
+- Corrections and added records need a reason and are written to the activity log.
+- The app records the time of the click. It does not check where the person is or which device they use.
+
+## Adding the 65 users
+
+Users page, "Add many users from a file". Upload a .csv with the columns Username, Full Name, Role, Branch.
+The page shows each new user's temporary password once and lets you download the list. Each user must set their
+own password at first sign-in. Delete the downloaded file after handing the passwords out.
+
+## Clusters and the quarter ranking
+
+- Each branch belongs to a cluster. Branch01 to Branch05 are Cluster01, Branch06 to Branch10 are Cluster02, and so on.
+  The owner can move a branch on the Admin page.
+- Quarter Ranking (manager, owner): quarter to date for all branches and for each cluster, with the previous quarter.
+- My Cluster (branch): the figures of the branches in the person's own cluster only. Program Rank is counted across
+  all branches, and Cluster Rank is the position inside the cluster.
+
+## Updating a database that already runs the Branch KPI app
+
+Upload the new files. On the next start the app adds the cluster column, the attendance table and the employee role.
+Existing users, entries and passwords are kept. Export a copy of the data first.
+
+Optional secrets: `APP_TIMEZONE = "Asia/Manila"` and `PORTAL_NAME = "Company Portal"`.
+Files to upload: `app.py`, `kpi_logic.py`, `att_logic.py`, `requirements.txt`, `README.md`, the `data` folder, `.streamlit/config.toml`.
+
+## Checks
+
+`python test_logic.py` (Branch KPI) and `python test_att.py` (accounts and attendance).
+
+---
+
+The sections below are from the Branch KPI app and still apply.
 
 ## Deploy with a hosted PostgreSQL database
 
@@ -51,6 +89,33 @@ and restores the user.
 - Anyone who has the full address with the code is signed in as that user until it expires.
   Users should copy only the plain app address when sharing a link, and sign out on shared devices.
 
+## Going live with real data
+
+1. Admin page, Metrics and multipliers: set up the real metric list.
+   - Add each real metric with its multiplier.
+   - Deactivate the sample metrics that are not used (Cat_001 and so on). Branches are asked for the active ones only.
+   - The list can be any length, for example 15. Submission Check counts the active metrics.
+2. Admin page, Remove sample data: tick the box and click Remove sample entries. This deletes only the sample
+   rows loaded at first start. Entries typed or imported by users are kept.
+3. Admin page, Import a branch file: import each branch's July to September file.
+4. Branches then enter each day on the Daily Entry page.
+5. Older history can be imported later, one branch file at a time. Importing never creates duplicates.
+   Past rankings change once older data is added, because the app always calculates from what is stored.
+
+A month with nothing before it shows no comparison with the previous month. That is expected for the first month loaded.
+
+## Password lockout
+
+After 5 wrong passwords in a row within 15 minutes, the account is locked for 15 minutes.
+The owner can unlock it at once with Reset password on the Users page. Each lock is written to the activity log.
+Change `MAX_FAILED_LOGINS` and `LOCK_MINUTES` in `kpi_logic.py` to set other limits.
+
+## Faster loading
+
+The app keeps the entries in memory for up to 2 minutes, so a click does not reload everything from the database.
+The memory is cleared straight after a save, an import, a multiplier change or a new branch, so those show at once.
+Changes made by another user show within 2 minutes.
+
 ## Adding a branch
 
 Example: a new branch, Branch21, for the Philippines.
@@ -78,6 +143,7 @@ a whole number of 0 or higher are skipped and reported.
 ## Updating an app that is already deployed
 
 Replace `app.py`, `kpi_logic.py`, `requirements.txt`, `test_logic.py` and `README.md` in the GitHub repository.
+The app updates the database by itself on the next start (new tables and columns are added, nothing is removed).
 The app restarts and adds the new `sessions` table by itself. Existing entries and users are kept.
 
 ## Roles
@@ -98,13 +164,13 @@ The app restarts and adds the new `sessions` table by itself. Existing entries a
 
 - `app.py`: the pages (Streamlit).
 - `kpi_logic.py`: database, accounts and calculations. No page code.
-- `test_logic.py`: 60 checks. Run `python test_logic.py`. Set `DATABASE_URL` to an empty test database to run them on PostgreSQL.
+- `test_logic.py`: 80 checks. Run `python test_logic.py`. Set `DATABASE_URL` to an empty test database to run them on PostgreSQL.
 - `data/`: metrics, branches and sample entries loaded on the first start.
 - `.streamlit/secrets.toml.example`: the three settings to paste into Secrets.
 
 ## What was tested
 
-- All 60 checks pass on SQLite and on a real PostgreSQL 16 server. They cover the Excel numbers
+- All 80 checks pass on SQLite and on a real PostgreSQL 16 server. They cover the Excel numbers
   (total 158,954.7, Australia rank 1, Russia rank 15, September 18,383.3, change +17.15%), entry rules,
   the account rules (temporary password, forced change, reset, deactivate, hashing, activity log),
   and the stay-signed-in rules (refresh, sign-out, expiry, reset and deactivate end the session).
@@ -115,7 +181,6 @@ The app restarts and adds the new `sessions` table by itself. Existing entries a
 
 ## Still needed before real production use
 
-1. A lockout after repeated wrong passwords.
-2. Daily database backups (paid database plans include them).
-3. A server that does not sleep, and a web address of the company's own.
-4. Someone who can maintain the code and the database.
+1. Daily database backups (paid database plans include them).
+2. A server that does not sleep, and a web address of the company's own.
+3. Someone who can maintain the code and the database.
