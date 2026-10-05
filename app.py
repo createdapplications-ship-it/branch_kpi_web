@@ -39,6 +39,8 @@ div[class*="st-key-menu_card"] button svg {{color: #FFFFFF !important; fill: #FF
 div[class*="st-key-menu_card"] button {{border: none !important; background: transparent !important;
     font-size: .95rem; padding: .3rem .5rem; min-height: 2.2rem;}}
 div[class*="st-key-menu_card"] button:hover {{background: rgba(255,255,255,.12) !important;}}
+div[data-testid="stPopoverBody"] {{min-width: 13rem; padding: .6rem .7rem;}}
+div[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] {{gap: .1rem;}}
 div[data-testid="stPopoverBody"] button[kind="tertiary"] {{justify-content: flex-start; width: 100%; color: #1B1B1B;
     padding: .25rem .5rem; border-radius: 4px;}}
 div[data-testid="stPopoverBody"] button[kind="tertiary"]:hover {{background: #EEF4FB; color: #0F6CBD;}}
@@ -134,6 +136,8 @@ def go_to(section, page=None):
     """Open a section, on its first page unless a page is given."""
     st.session_state["dest"] = section
     st.session_state["nav"] = (section, page)
+    # A new number rebuilds the drop-down menus, which closes the one that was open.
+    st.session_state["nav_n"] = st.session_state.get("nav_n", 0) + 1
 
 
 def xl_table(t, formats=None, status=None):
@@ -1131,17 +1135,18 @@ def main():
         st.query_params["pg"] = page
     with st.container(key="menu_card"):
         menus = [n for n in secs if n != "Home"]
+        nn = st.session_state.get("nav_n", 0)
         cols = st.columns([2.6, 0.8] + [1.4] * len(menus) + [max(0.5, 5.4 - 1.4 * len(menus)), 2.0],
                           vertical_alignment="center")
         cols[0].markdown(f'<div class="brand"><span class="dot"></span>{PORTAL_NAME}</div>', unsafe_allow_html=True)
         with cols[1].container(key="navsec_Home"):
             st.button("Home", key="nav_home", type="tertiary", on_click=go_to, args=("Home", "Home"))
         for i, name in enumerate(menus):
-            with cols[2 + i].container(key="navsec_" + name.replace(" ", "_")):
+            with cols[2 + i].container(key=f"navsec_{name.replace(' ', '_')}_{nn}"):
                 with st.popover(name):
                     for p in secs[name]:
                         st.button(p, key=f"nav_{name}_{p}", type="tertiary", on_click=go_to, args=(name, p))
-        with cols[-1].container(key="navsec_user"):
+        with cols[-1].container(key=f"navsec_user_{nn}"):
             with st.popover(user["full_name"]):
                 st.caption(f"Role: {user['role']}")
                 for p in secs["Home"][1:]:
