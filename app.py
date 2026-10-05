@@ -12,7 +12,26 @@ import streamlit as st
 import kpi_logic as k
 import att_logic as a
 
-st.set_page_config(page_title="Company Portal", layout="wide")
+st.set_page_config(page_title="Company Portal", layout="wide", initial_sidebar_state="collapsed")
+
+# Look of the portal: grey page, white cards and a floating menu box.
+st.markdown(f"""
+<style>
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {{display: none;}}
+.block-container {{padding-top: 3.2rem; max-width: 1500px;}}
+h1, h2, h3 {{font-family: "Segoe UI", Arial, sans-serif; font-weight: 600; letter-spacing: 0;}}
+h1 {{font-size: 1.9rem;}}
+/* cards */
+div[class*="st-key-card_"], div[class*="st-key-menu_card"] {{
+    background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 8px; padding: 1.4rem 1.6rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);}}
+/* floating menu box: stays at the top while the page scrolls */
+div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; padding: .8rem 1.4rem;
+    box-shadow: 0 4px 14px rgba(0,0,0,.16);}}
+div[class*="st-key-menu_card"] label p {{font-size: .95rem;}}
+[data-testid="stMetric"] {{background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 8px; padding: .8rem 1rem;}}
+</style>
+""", unsafe_allow_html=True)
 
 
 def cfg(name, default=None):
@@ -83,9 +102,20 @@ def go_to(section):
     st.session_state["section"] = section
 
 
+def xl_table(t, formats=None):
+    """Show a table across the full width. Click a column header to sort."""
+    rows = min(len(t), 20)
+    st.dataframe(t.style.format(formats or {}, na_rep=""), use_container_width=True, hide_index=True,
+                 height=38 + 35 * max(rows, 1))
+
+
 def fmt_table(df, cols, formats=None):
-    t = df[list(cols)].rename(columns=cols)
-    st.dataframe(t.style.format(formats or {}, na_rep=""), use_container_width=True, hide_index=True)
+    xl_table(df[list(cols)].rename(columns=cols), formats)
+
+
+def card(key):
+    """A white box, like a tile on the page."""
+    return st.container(key="card_" + key)
 
 
 def branch_label(branches):
@@ -128,14 +158,14 @@ def landing_page():
     st.title(PORTAL_NAME)
     st.caption("Choose where to go. You sign in with your own username and password.")
     c1, c2 = st.columns(2)
-    with c1:
+    with c1, card("land_att"):
         st.subheader("Attendance")
-        st.write("Time in and time out, and see your own attendance.")
-        st.button("Open Attendance", key="open_att", on_click=choose, args=("Attendance",))
-    with c2:
+        st.write("Time in and time out each day, and see your own attendance record for the month.")
+        st.button("Open Attendance", key="open_att", type="primary", on_click=choose, args=("Attendance",))
+    with c2, card("land_kpi"):
         st.subheader("Branch KPI")
-        st.write("Enter daily values and view the rankings and dashboards.")
-        st.button("Open Branch KPI", key="open_kpi", on_click=choose, args=("Branch KPI",))
+        st.write("Enter the daily values for your branch, and view the rankings, clusters and dashboards.")
+        st.button("Open Branch KPI", key="open_kpi", type="primary", on_click=choose, args=("Branch KPI",))
 
 
 def login_page():
@@ -336,8 +366,7 @@ def page_main_dashboard(user):
     c2.metric("Previous month, same days", f"{info['prev_total']:,.1f}")
     c3.metric("Top branch", top.iloc[0]["branch"] if len(top) else "No data")
     c4.metric("Branches reporting", f"{len(top)} of {len(branches)}")
-    left, right = st.columns([3, 2])
-    with left:
+    if True:
         st.subheader("Ranking, month to date")
         fmt_table(table,
                   {"rank": "Rank", "branch": "Branch", "adjusted": "Adjusted Value", "prev_adjusted": "Previous Month",
@@ -345,15 +374,17 @@ def page_main_dashboard(user):
                    "days_reported": "Days Reported"},
                   {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Previous Month": "{:,.1f}", "Change %": "{:+.1%}",
                    "Previous Rank": "{:.0f}", "Rank Change": "{:+.0f}", "Days Reported": "{:.0f}"})
-    with right:
-        st.subheader("Daily Adjusted Value")
-        d = k.daily_breakdown(df, info["cur_start"], info["cur_end"])
-        if len(d):
+    d = k.daily_breakdown(df, info["cur_start"], info["cur_end"])
+    if len(d):
+        g1, g2 = st.columns(2)
+        with g1:
+            st.subheader("Daily Adjusted Value")
             st.bar_chart(d.set_index("date")["adjusted"])
+        with g2:
             st.subheader("Running total")
             st.line_chart(d.set_index("date")["running_total"])
-        else:
-            st.info("No entries yet for this month.")
+    else:
+        st.info("No entries yet for this month.")
 
 
 def page_kpi_dashboard(user):
@@ -376,15 +407,14 @@ def page_kpi_dashboard(user):
     m1.metric("Adjusted Value", f"{have['adjusted'].sum():,.1f}")
     m2.metric("Top branch", have.iloc[0]["branch"] if len(have) else "No data")
     m3.metric("Lowest branch", have.iloc[-1]["branch"] if len(have) else "No data")
-    left, right = st.columns([3, 2])
-    with left:
+    if True:
         fmt_table(r, {"rank": "Rank", "branch": "Branch", "adjusted": "Adjusted Value", "share": "Share of Company",
                       "days_reported": "Days Reported", "avg_per_day": "Avg per Day", "last_date": "Last Reported"},
                   {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Share of Company": "{:.1%}",
                    "Days Reported": "{:.0f}", "Avg per Day": "{:,.1f}", "Last Reported": "{:%d %b %Y}"})
-    with right:
-        if len(have):
-            st.bar_chart(have.set_index("branch")["adjusted"])
+    if len(have):
+        st.subheader("Adjusted Value by branch")
+        st.bar_chart(have.set_index("branch")["adjusted"])
     st.download_button("Download ranking as CSV", r.to_csv(index=False), "ranking.csv", "text/csv")
 
 
@@ -402,16 +432,13 @@ def page_drill_down(user):
         st.info("No entries for this branch in the selected dates.")
         return
     st.metric("Adjusted Value", f"{d['adjusted'].sum():,.1f}")
-    left, right = st.columns(2)
-    with left:
-        st.subheader("By day")
-        st.bar_chart(d.set_index("date")["adjusted"])
-    with right:
-        st.subheader("By metric")
-        fmt_table(k.metric_breakdown(df, start, end, code),
-                  {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
-                   "adjusted": "Adjusted Value", "share": "Share"},
-                  {"Multiplier": "{:.1f}", "Metric Value": "{:,.0f}", "Adjusted Value": "{:,.1f}", "Share": "{:.1%}"})
+    st.subheader("By metric")
+    fmt_table(k.metric_breakdown(df, start, end, code),
+              {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
+               "adjusted": "Adjusted Value", "share": "Share"},
+              {"Multiplier": "{:.1f}", "Metric Value": "{:,.0f}", "Adjusted Value": "{:,.1f}", "Share": "{:.1%}"})
+    st.subheader("By day")
+    st.bar_chart(d.set_index("date")["adjusted"])
 
 
 def page_submission_check(user):
@@ -476,12 +503,12 @@ def page_users(user):
             created, problems = k.bulk_create_users(db, pd.read_csv(up, dtype=str), by=user["username"])
             st.success(f"{len(created)} user(s) created. {len(problems)} row(s) skipped.")
             if len(created):
-                st.dataframe(created, use_container_width=True, hide_index=True)
+                xl_table(created)
                 st.download_button("Download the temporary passwords (shown only once)", created.to_csv(index=False),
                                    "temporary_passwords.csv", "text/csv")
                 st.caption("Hand each password to its user, then delete the downloaded file.")
             if len(problems):
-                st.dataframe(problems, use_container_width=True, hide_index=True)
+                xl_table(problems)
         except ValueError as err:
             st.error(str(err))
 
@@ -611,7 +638,7 @@ def page_admin(user):
         refresh_data()
         st.success(f"{removed:,} sample entries removed.")
     st.subheader("Recent activity")
-    st.dataframe(k.recent_log(db), use_container_width=True, hide_index=True)
+    xl_table(k.recent_log(db).rename(columns={"at": "When", "username": "User", "action": "Action", "detail": "Detail"}))
 
 
 def page_my_account(user):
@@ -628,17 +655,17 @@ def page_home(user):
     st.write(f"Signed in as **{user['full_name']}**.")
     secs = sections_for(user["role"])
     c1, c2 = st.columns(2)
-    with c1:
+    with c1, card("home_att"):
         st.subheader("Attendance")
         state, rec = a.status(db, user["username"])
         st.write({"in": "You are timed in.", "out": "You are not timed in.",
                   "no_time_out": "An earlier time in was never closed."}[state])
-        st.button("Open Attendance", key="home_att", on_click=go_to, args=("Attendance",))
-    with c2:
+        st.button("Open Attendance", key="home_att", type="primary", on_click=go_to, args=("Attendance",))
+    with c2, card("home_kpi"):
         st.subheader("Branch KPI")
         if "Branch KPI" in secs:
             st.write("Enter daily values and view the rankings and dashboards.")
-            st.button("Open Branch KPI", key="home_kpi", on_click=go_to, args=("Branch KPI",))
+            st.button("Open Branch KPI", key="home_kpi", type="primary", on_click=go_to, args=("Branch KPI",))
         else:
             st.write("Your account does not have Branch KPI access. Ask the owner if you need it.")
 
@@ -657,7 +684,7 @@ def att_table(r, with_name=True):
     t["Hours"] = r["hours"]
     t["Status"] = r["status"]
     t["Note"] = r["note"].fillna("")
-    st.dataframe(t.style.format({"Hours": "{:.2f}"}, na_rep=""), use_container_width=True, hide_index=True)
+    xl_table(t, {"Hours": "{:.2f}"})
 
 
 def page_my_attendance(user):
@@ -712,7 +739,7 @@ def page_attendance_today(user):
     t = pd.DataFrame({"Name": b["full_name"], "Branch": b["branch_code"].fillna(""), "Status": b["status"],
                       "First In": [_hm(v) for v in b["first_in"]], "Last Out": [_hm(v) for v in b["last_out"]],
                       "Hours": b["hours"]})
-    st.dataframe(t.style.format({"Hours": "{:.2f}"}, na_rep=""), use_container_width=True, hide_index=True)
+    xl_table(t, {"Hours": "{:.2f}"})
     st.caption(f"Times are shown in {a.TZ_NAME} time.")
 
 
@@ -839,25 +866,29 @@ def main():
     if user.get("must_change"):
         password_form(user, forced=True)
         return
-    with st.sidebar:
-        st.write(f"Signed in as **{user['full_name']}** ({user['role']})")
+    with st.container(key="menu_card"):
         secs = sections_for(user["role"])
         names = list(secs)
         dest = st.session_state.get("dest")
         if st.session_state.get("section") not in names:
             st.session_state["section"] = dest if dest in names else names[0]
-        section = st.radio("Section", names, key="section")
-        page = st.radio("Go to", secs[section], key="page_" + section)
-        if st.button("Sign out"):
+        m1, m2 = st.columns([5, 1])
+        with m1:
+            section = st.radio("Section", names, key="section", horizontal=True)
+            page = st.radio("Go to", secs[section], key="page_" + section, horizontal=True)
+        with m2:
+            st.caption(f"{user['full_name']} ({user['role']})")
+            out = st.button("Sign out")
+        if out:
             k.end_session(db, st.session_state.get("token"))
             st.session_state.pop("user", None)
             st.session_state.pop("token", None)
             st.session_state.pop("dest", None)
             st.query_params.clear()
             st.rerun()
-        st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "
-                   "Do not share the page address while signed in.")
     PAGE_FUNCS[page](user)
+    st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "
+               "Do not share the page address while signed in.")
 
 
 main()
