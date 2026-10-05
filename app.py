@@ -25,10 +25,35 @@ h1 {{font-size: 1.9rem;}}
 div[class*="st-key-card_"], div[class*="st-key-menu_card"] {{
     background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 8px; padding: 1.4rem 1.6rem;
     box-shadow: 0 1px 3px rgba(0,0,0,.08);}}
-/* floating menu box: stays at the top while the page scrolls */
-div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; padding: .8rem 1.4rem;
-    box-shadow: 0 4px 14px rgba(0,0,0,.16);}}
-div[class*="st-key-menu_card"] label p {{font-size: .95rem;}}
+/* top bar: portal name, drop-down menus and a breadcrumb line. Stays at the top while the page scrolls */
+div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; padding: .45rem 1.4rem .55rem 1.4rem;
+    border-radius: 0; border-width: 0 0 1px 0; box-shadow: 0 2px 8px rgba(0,0,0,.12);}}
+div[class*="st-key-menu_card"] .brand {{font-size: 1.15rem; font-weight: 600; color: #1B1B1B;
+    border-right: 2px solid #1B1B1B; padding-right: 1rem; white-space: nowrap;}}
+div[class*="st-key-menu_card"] [data-testid="stPopover"] button,
+div[class*="st-key-menu_card"] button[kind="tertiary"] {{border: none; background: transparent; color: #1B1B1B;
+    font-size: .92rem; padding: .2rem .4rem;}}
+div[class*="st-key-menu_card"] [data-testid="stPopover"] button:hover,
+button[kind="tertiary"]:hover {{text-decoration: underline; color: #0F6CBD;}}
+div[data-testid="stPopoverBody"] button[kind="tertiary"] {{justify-content: flex-start; width: 100%; color: #1B1B1B;}}
+.crumb {{font-size: .9rem; color: #1B1B1B; padding-top: .35rem; border-top: 1px solid #EDEDED; margin-top: .3rem;}}
+.crumb span {{color: #0F6CBD; text-decoration: underline;}}
+/* colours set here as well, so the look does not depend on the config file */
+.stApp {{background: #E9E9E9;}}
+button[kind="primary"] {{background: #0F6CBD; border-color: #0F6CBD; color: #FFFFFF;}}
+button[kind="primary"]:hover {{background: #0C5AA0; border-color: #0C5AA0; color: #FFFFFF;}}
+/* dashboard: title band, stat tiles, chart panel titles, section bands */
+.band {{background: #1F2A44; color: #FFFFFF; text-align: center; padding: .9rem 1rem .7rem; border-radius: 6px 6px 0 0;}}
+.band-t {{font-size: 1.5rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;}}
+.band-s {{font-size: .85rem; opacity: .85; margin-top: .15rem;}}
+.tiles {{display: flex; gap: 12px; margin: 12px 0 16px; flex-wrap: wrap;}}
+.tile {{flex: 1 1 160px; background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 6px; overflow: hidden; text-align: center;}}
+.tile-h {{color: #FFFFFF; font-size: .72rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; padding: .3rem .4rem;}}
+.tile-v {{font-size: 1.9rem; font-weight: 700; padding-top: .45rem; line-height: 1.15;}}
+.tile-n {{font-size: .78rem; color: #6B7280; padding: .1rem 0 .55rem;}}
+.ptitle {{text-align: center; font-weight: 700; font-size: 1.05rem; color: #1B1B1B; margin-bottom: .3rem;}}
+.sband {{color: #FFFFFF; font-weight: 700; text-align: center; padding: .5rem 1rem; border-radius: 6px 6px 0 0;
+    margin-top: 1rem; letter-spacing: .02em;}}
 [data-testid="stMetric"] {{background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 8px; padding: .8rem 1rem;}}
 </style>
 """, unsafe_allow_html=True)
@@ -97,9 +122,10 @@ def sections_for(role):
     return out
 
 
-def go_to(section):
+def go_to(section, page=None):
+    """Open a section, on its first page unless a page is given."""
     st.session_state["dest"] = section
-    st.session_state["section"] = section
+    st.session_state["nav"] = (section, page)
 
 
 def xl_table(t, formats=None):
@@ -351,40 +377,151 @@ def page_quarter_ranking(user):
     st.download_button("Download quarter ranking as CSV", view.to_csv(index=False), "quarter_ranking.csv", "text/csv")
 
 
+# ---------------------------------------------------------------- dashboard building blocks
+BLUE, GREY, GREEN, AMBER, RED, NAVY = "#0F6CBD", "#9AA5B1", "#2E8B57", "#D9822B", "#C0392B", "#1F2A44"
+CLUSTER_COLOURS = ["#0F6CBD", "#2E8B57", "#D9822B", "#7A5AA6", "#3AA6B9", "#9AA5B1"]
+
+
+def title_band(title, subtitle):
+    st.markdown(f'<div class="band"><div class="band-t">{title}</div><div class="band-s">{subtitle}</div></div>',
+                unsafe_allow_html=True)
+
+
+def section_band(text, colour=NAVY):
+    st.markdown(f'<div class="sband" style="background:{colour}">{text}</div>', unsafe_allow_html=True)
+
+
+def tiles(items):
+    """A row of stat tiles. items: list of (label, value, note, colour)."""
+    cells = "".join(
+        f'<div class="tile"><div class="tile-h" style="background:{c}">{label}</div>'
+        f'<div class="tile-v" style="color:{c}">{value}</div><div class="tile-n">{note}</div></div>'
+        for label, value, note, c in items)
+    st.markdown(f'<div class="tiles">{cells}</div>', unsafe_allow_html=True)
+
+
+def panel(key, title):
+    """A white chart panel with a centred title."""
+    box = st.container(key="card_" + key)
+    box.markdown(f'<div class="ptitle">{title}</div>', unsafe_allow_html=True)
+    return box
+
+
+def chart(data, spec):
+    spec = {"config": {"view": {"stroke": None}, "axis": {"labelFontSize": 12, "titleFontSize": 12, "grid": True,
+                                                           "gridColor": "#EEEEEE"}}, **spec}
+    st.vega_lite_chart(data, spec, use_container_width=True)
+
+
+def colour_status(value):
+    return {"Submitted": f"color: {GREEN}; font-weight: 600", "Partial": f"color: {AMBER}; font-weight: 600",
+            "Not submitted": f"color: {RED}; font-weight: 600"}.get(value, "")
+
+
 def page_main_dashboard(user):
-    st.title("Main Dashboard")
     df = fact()
     branches = branch_list()
     as_of = st.date_input("As of date", value=k.latest_data_date(df), max_value=date.today())
     table, info = k.mtd_compare(df, as_of, branches)
-    st.caption(f"Month to date {info['cur_start']:%d %b} to {info['cur_end']:%d %b %Y}, compared with "
-               f"{info['prev_start']:%d %b} to {info['prev_end']:%d %b %Y}.")
+    title_band("Branch KPI Dashboard",
+               f"Month to date {info['cur_start']:%d %b} to {info['cur_end']:%d %b %Y} &nbsp;|&nbsp; compared with "
+               f"{info['prev_start']:%d %b} to {info['prev_end']:%d %b %Y}")
     top = table.dropna(subset=["rank"])
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Adjusted Value, MTD", f"{info['cur_total']:,.1f}",
-              f"{info['change_pct']:+.1%} vs previous month" if info["change_pct"] is not None else None)
-    c2.metric("Previous month, same days", f"{info['prev_total']:,.1f}")
-    c3.metric("Top branch", top.iloc[0]["branch"] if len(top) else "No data")
-    c4.metric("Branches reporting", f"{len(top)} of {len(branches)}")
-    if True:
-        st.subheader("Ranking, month to date")
-        fmt_table(table,
-                  {"rank": "Rank", "branch": "Branch", "adjusted": "Adjusted Value", "prev_adjusted": "Previous Month",
-                   "change_pct": "Change %", "prev_rank": "Previous Rank", "rank_change": "Rank Change",
-                   "days_reported": "Days Reported"},
-                  {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Previous Month": "{:,.1f}", "Change %": "{:+.1%}",
-                   "Previous Rank": "{:.0f}", "Rank Change": "{:+.0f}", "Days Reported": "{:.0f}"})
-    d = k.daily_breakdown(df, info["cur_start"], info["cur_end"])
-    if len(d):
-        g1, g2 = st.columns(2)
-        with g1:
-            st.subheader("Daily Adjusted Value")
-            st.bar_chart(d.set_index("date")["adjusted"])
-        with g2:
-            st.subheader("Running total")
-            st.line_chart(d.set_index("date")["running_total"])
-    else:
+    by_cluster = (top.groupby("cluster", as_index=False)["adjusted"].sum()
+                  .sort_values("adjusted", ascending=False).reset_index(drop=True))
+    change = info["change_pct"]
+    reporting, total = len(top), len(branches)
+    tiles([
+        ("Adjusted Value, MTD", f"{info['cur_total']:,.1f}", "All branches", BLUE),
+        ("Change vs previous month", f"{change:+.1%}" if change is not None else "n/a",
+         f"Previous: {info['prev_total']:,.1f}", GREY if change is None else (GREEN if change >= 0 else RED)),
+        ("Top branch", top.iloc[0]["branch"] if len(top) else "No data",
+         f"{top.iloc[0]['adjusted']:,.1f}" if len(top) else "", BLUE),
+        ("Top cluster", by_cluster.iloc[0]["cluster"] if len(by_cluster) else "No data",
+         f"{by_cluster.iloc[0]['adjusted']:,.1f}" if len(by_cluster) else "", BLUE),
+        ("Branches reporting", f"{reporting} of {total}", "This month",
+         GREEN if reporting == total else AMBER),
+    ])
+    if not len(top):
         st.info("No entries yet for this month.")
+        return
+
+    g1, g2 = st.columns([3, 2])
+    with g1, panel("rank", "Adjusted Value by Branch"):
+        chart(top[["branch", "cluster", "adjusted", "rank"]], {
+            "mark": {"type": "bar", "color": BLUE, "cornerRadiusEnd": 2},
+            "encoding": {
+                "y": {"field": "branch", "type": "nominal", "sort": "-x", "title": None},
+                "x": {"field": "adjusted", "type": "quantitative", "title": "Adjusted Value"},
+                "tooltip": [{"field": "branch", "title": "Branch"}, {"field": "cluster", "title": "Cluster"},
+                            {"field": "rank", "title": "Rank"},
+                            {"field": "adjusted", "title": "Adjusted Value", "format": ",.1f"}]},
+            "height": {"step": 20}})
+    with g2, panel("cluster", "Share by Cluster"):
+        chart(by_cluster, {
+            "mark": {"type": "arc", "innerRadius": 70},
+            "encoding": {
+                "theta": {"field": "adjusted", "type": "quantitative", "stack": True},
+                "color": {"field": "cluster", "type": "nominal", "scale": {"range": CLUSTER_COLOURS},
+                          "legend": {"title": None, "orient": "bottom"}},
+                "order": {"field": "adjusted", "type": "quantitative", "sort": "descending"},
+                "tooltip": [{"field": "cluster", "title": "Cluster"},
+                            {"field": "adjusted", "title": "Adjusted Value", "format": ",.1f"}]},
+            "height": 320})
+
+    cur = k.daily_breakdown(df, info["cur_start"], info["cur_end"])
+    prev = k.daily_breakdown(df, info["prev_start"], info["prev_end"])
+    g3, g4 = st.columns(2)
+    with g3, panel("daily", "Daily Adjusted Value"):
+        chart(cur.assign(day=cur["date"].dt.strftime("%d"))[["day", "adjusted"]], {
+            "mark": {"type": "bar", "color": BLUE},
+            "encoding": {
+                "x": {"field": "day", "type": "ordinal", "sort": None, "title": "Day of month",
+                      "axis": {"labelAngle": 0}},
+                "y": {"field": "adjusted", "type": "quantitative", "title": "Adjusted Value"},
+                "tooltip": [{"field": "day", "title": "Date"},
+                            {"field": "adjusted", "title": "Adjusted Value", "format": ",.1f"}]},
+            "height": 280})
+    with g4, panel("compare", "Running Total: This Month vs Previous Month"):
+        lines = pd.concat([
+            pd.DataFrame({"day": cur["date"].dt.day, "total": cur["running_total"], "series": "This month"}),
+            pd.DataFrame({"day": prev["date"].dt.day, "total": prev["running_total"], "series": "Previous month"})])
+        chart(lines, {
+            "mark": {"type": "line", "point": True, "strokeWidth": 2.5},
+            "encoding": {
+                "x": {"field": "day", "type": "quantitative", "title": "Day of month", "axis": {"tickMinStep": 1}},
+                "y": {"field": "total", "type": "quantitative", "title": "Running total"},
+                "color": {"field": "series", "type": "nominal",
+                          "scale": {"domain": ["This month", "Previous month"], "range": [BLUE, GREY]},
+                          "legend": {"title": None, "orient": "bottom"}},
+                "strokeDash": {"field": "series", "type": "nominal",
+                               "scale": {"domain": ["This month", "Previous month"], "range": [[1, 0], [5, 4]]},
+                               "legend": None},
+                "tooltip": [{"field": "series", "title": "Period"}, {"field": "day", "title": "Day"},
+                            {"field": "total", "title": "Running total", "format": ",.1f"}]},
+            "height": 280})
+
+    if user["role"] in ("manager", "owner"):
+        day = k.last_working_day(as_of)
+        sub = k.submission_check(db, day)
+        missing = sub[sub["status"] != "Submitted"]
+        if len(missing):
+            section_band(f"Needs attention: {len(missing)} branch(es) not fully submitted for {day:%a %d %b %Y}", RED)
+            t = missing.rename(columns={"branch_code": "Branch Code", "branch": "Branch", "entered": "Metrics Entered",
+                                        "expected": "Expected", "status": "Status"})[
+                ["Branch Code", "Branch", "Metrics Entered", "Expected", "Status"]]
+            st.dataframe(t.style.map(colour_status, subset=["Status"]), use_container_width=True, hide_index=True,
+                         height=38 + 35 * min(len(t), 10))
+        else:
+            section_band(f"All branches submitted for {day:%a %d %b %Y}", GREEN)
+
+    section_band("Ranking, month to date")
+    fmt_table(table,
+              {"rank": "Rank", "branch": "Branch", "cluster": "Cluster", "adjusted": "Adjusted Value",
+               "prev_adjusted": "Previous Month", "change_pct": "Change %", "prev_rank": "Previous Rank",
+               "rank_change": "Rank Change", "days_reported": "Days Reported"},
+              {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Previous Month": "{:,.1f}", "Change %": "{:+.1%}",
+               "Previous Rank": "{:.0f}", "Rank Change": "{:+.0f}", "Days Reported": "{:.0f}"})
 
 
 def page_kpi_dashboard(user):
@@ -866,24 +1003,44 @@ def main():
     if user.get("must_change"):
         password_form(user, forced=True)
         return
+    secs = sections_for(user["role"])
+    # The open page is kept in the address too, so a refresh returns to the same page.
+    section, page = st.session_state.get("nav") or (
+        st.query_params.get("sec") or st.session_state.get("dest"), st.query_params.get("pg"))
+    if section not in secs:
+        section = "Home"
+    if page not in secs[section]:
+        page = secs[section][0]
+    st.session_state["nav"] = (section, page)
+    if st.query_params.get("pg") != page or st.query_params.get("sec") != section:
+        st.query_params["sec"] = section
+        st.query_params["pg"] = page
     with st.container(key="menu_card"):
-        secs = sections_for(user["role"])
-        names = list(secs)
-        dest = st.session_state.get("dest")
-        if st.session_state.get("section") not in names:
-            st.session_state["section"] = dest if dest in names else names[0]
-        m1, m2 = st.columns([5, 1])
-        with m1:
-            section = st.radio("Section", names, key="section", horizontal=True)
-            page = st.radio("Go to", secs[section], key="page_" + section, horizontal=True)
-        with m2:
-            st.caption(f"{user['full_name']} ({user['role']})")
-            out = st.button("Sign out")
+        menus = [n for n in secs if n != "Home"]
+        cols = st.columns([2.4, 0.9] + [1.5] * len(menus) + [max(0.5, 5.2 - 1.5 * len(menus)), 2.2, 1.1],
+                          vertical_alignment="center")
+        cols[0].markdown(f'<div class="brand">{PORTAL_NAME}</div>', unsafe_allow_html=True)
+        cols[1].button("Home", key="nav_home", type="tertiary", on_click=go_to, args=("Home", "Home"))
+        for i, name in enumerate(menus):
+            with cols[2 + i].popover(name):
+                for p in secs[name]:
+                    st.button(p, key=f"nav_{name}_{p}", type="tertiary", on_click=go_to, args=(name, p))
+        with cols[-2].popover(user["full_name"]):
+            st.caption(f"Role: {user['role']}")
+            for p in secs["Home"][1:]:
+                st.button(p, key=f"nav_Home_{p}", type="tertiary", on_click=go_to, args=("Home", p))
+            out = st.button("Sign out", key="nav_sign_out")
+        trail = ["Home"] if section == "Home" and page == "Home" else (
+            ["Home", page] if section == "Home" else ["Home", section, page])
+        st.markdown('<div class="crumb">' + " &nbsp;/&nbsp; ".join(
+            f"<b>{t}</b>" if i == len(trail) - 1 else f"<span>{t}</span>" for i, t in enumerate(trail)) + "</div>",
+            unsafe_allow_html=True)
         if out:
             k.end_session(db, st.session_state.get("token"))
             st.session_state.pop("user", None)
             st.session_state.pop("token", None)
             st.session_state.pop("dest", None)
+            st.session_state.pop("nav", None)
             st.query_params.clear()
             st.rerun()
     PAGE_FUNCS[page](user)
