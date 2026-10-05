@@ -25,19 +25,27 @@ h1 {{font-size: 1.9rem;}}
 div[class*="st-key-card_"], div[class*="st-key-menu_card"] {{
     background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 8px; padding: 1.4rem 1.6rem;
     box-shadow: 0 1px 3px rgba(0,0,0,.08);}}
-/* top bar: portal name, drop-down menus and a breadcrumb line. Stays at the top while the page scrolls */
-div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; padding: .45rem 1.4rem .55rem 1.4rem;
-    border-radius: 0; border-width: 0 0 1px 0; box-shadow: 0 2px 8px rgba(0,0,0,.12);}}
-div[class*="st-key-menu_card"] .brand {{font-size: 1.15rem; font-weight: 600; color: #1B1B1B;
-    border-right: 2px solid #1B1B1B; padding-right: 1rem; white-space: nowrap;}}
-div[class*="st-key-menu_card"] [data-testid="stPopover"] button,
-div[class*="st-key-menu_card"] button[kind="tertiary"] {{border: none; background: transparent; color: #1B1B1B;
-    font-size: .92rem; padding: .2rem .4rem;}}
-div[class*="st-key-menu_card"] [data-testid="stPopover"] button:hover,
-button[kind="tertiary"]:hover {{text-decoration: underline; color: #0F6CBD;}}
-div[data-testid="stPopoverBody"] button[kind="tertiary"] {{justify-content: flex-start; width: 100%; color: #1B1B1B;}}
-.crumb {{font-size: .9rem; color: #1B1B1B; padding-top: .35rem; border-top: 1px solid #EDEDED; margin-top: .3rem;}}
-.crumb span {{color: #0F6CBD; text-decoration: underline;}}
+/* top bar: dark band with the portal name and drop-down menus. Stays at the top while the page scrolls */
+div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; background: #1F2A44; border: none;
+    border-radius: 8px; padding: .35rem 1.2rem; box-shadow: 0 3px 10px rgba(0,0,0,.22); gap: 0;}}
+div[class*="st-key-menu_card"] [data-testid="stMarkdownContainer"] {{margin: 0;}}
+div[class*="st-key-menu_card"] [data-testid="stMarkdownContainer"] p {{margin: 0;}}
+div[class*="st-key-menu_card"] .brand {{display: flex; align-items: center; gap: .55rem; font-size: 1.15rem;
+    font-weight: 700; color: #FFFFFF; white-space: nowrap; line-height: 2.2rem;}}
+div[class*="st-key-menu_card"] .brand .dot {{width: .8rem; height: .8rem; border-radius: 2px; background: #5BB0F0;
+    display: inline-block;}}
+div[class*="st-key-menu_card"] button, div[class*="st-key-menu_card"] button p,
+div[class*="st-key-menu_card"] button svg {{color: #FFFFFF !important; fill: #FFFFFF;}}
+div[class*="st-key-menu_card"] button {{border: none !important; background: transparent !important;
+    font-size: .95rem; padding: .3rem .5rem; min-height: 2.2rem;}}
+div[class*="st-key-menu_card"] button:hover {{background: rgba(255,255,255,.12) !important;}}
+div[data-testid="stPopoverBody"] button[kind="tertiary"] {{justify-content: flex-start; width: 100%; color: #1B1B1B;
+    padding: .25rem .5rem; border-radius: 4px;}}
+div[data-testid="stPopoverBody"] button[kind="tertiary"]:hover {{background: #EEF4FB; color: #0F6CBD;}}
+.crumb {{font-size: .88rem; color: #1B1B1B; background: #FFFFFF; border: 1px solid #E1E1E1; border-radius: 6px;
+    padding: .4rem 1rem; margin: .1rem 0 .4rem;}}
+.crumb span {{color: #0F6CBD;}}
+.crumb i {{font-style: normal; color: #9AA5B1; padding: 0 .55rem;}}
 /* colours set here as well, so the look does not depend on the config file */
 .stApp {{background: #E9E9E9;}}
 button[kind="primary"] {{background: #0F6CBD; border-color: #0F6CBD; color: #FFFFFF;}}
@@ -128,15 +136,17 @@ def go_to(section, page=None):
     st.session_state["nav"] = (section, page)
 
 
-def xl_table(t, formats=None):
-    """Show a table across the full width. Click a column header to sort."""
+def xl_table(t, formats=None, status=None):
+    """Show a table across the full width. Click a column header to sort. status: a column to show in colour."""
     rows = min(len(t), 20)
-    st.dataframe(t.style.format(formats or {}, na_rep=""), use_container_width=True, hide_index=True,
-                 height=38 + 35 * max(rows, 1))
+    styled = t.style.format(formats or {}, na_rep="")
+    if status and status in t.columns:
+        styled = styled.map(colour_status, subset=[status])
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=38 + 35 * max(rows, 1))
 
 
-def fmt_table(df, cols, formats=None):
-    xl_table(df[list(cols)].rename(columns=cols), formats)
+def fmt_table(df, cols, formats=None, status=None):
+    xl_table(df[list(cols)].rename(columns=cols), formats, status)
 
 
 def card(key):
@@ -277,22 +287,32 @@ def page_daily_entry(user):
 
 
 def page_my_branch(user):
-    st.title("My Branch")
     df = fact()
+    branches = branch_list()
     code = user["branch_code"]
+    name = branches.set_index("branch_code")["branch"].get(code, code)
     mine = df[df["branch_code"] == code]
     as_of = k.latest_data_date(mine) if len(mine) else date.today()
     start, _ = k.month_bounds(as_of)
     d = k.daily_breakdown(df, start, as_of, code)
-    c1, c2 = st.columns(2)
-    c1.metric("Adjusted Value, month to date", f"{d['adjusted'].sum():,.1f}")
-    c2.metric("Days reported this month", f"{len(d)}")
-    if len(d):
-        st.bar_chart(d.set_index("date")["adjusted"])
-    st.subheader("By metric, month to date")
-    fmt_table(k.metric_breakdown(df, start, as_of, code),
-              {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
-               "adjusted": "Adjusted Value", "share": "Share"},
+    mb = k.metric_breakdown(df, start, as_of, code)
+    title_band(f"My Branch: {name}", f"Month to date {pd.Timestamp(start):%d %b} to {pd.Timestamp(as_of):%d %b %Y}")
+    tiles([("Adjusted Value, MTD", f"{d['adjusted'].sum():,.1f}", code, BLUE),
+           ("Days reported", f"{len(d)}", "This month", BLUE),
+           ("Average per day", f"{d['adjusted'].mean():,.1f}" if len(d) else "n/a", "Adjusted Value", BLUE),
+           ("Top metric", mb.iloc[0]["metric"] if len(mb) else "No data",
+            f"{mb.iloc[0]['share']:.0%} of the total" if len(mb) else "", BLUE)])
+    if not len(d):
+        st.info("No entries yet for this month.")
+        return
+    g1, g2 = st.columns(2)
+    with g1, panel("mb_daily", "Daily Adjusted Value"):
+        vbar(d.assign(day=d["date"].dt.strftime("%d"))[["day", "adjusted"]], "day", "adjusted", "Day of month")
+    with g2, panel("mb_metric", "Adjusted Value by Metric"):
+        hbar(mb[["metric", "adjusted"]], "metric", "adjusted", "Metric")
+    section_band("By metric, month to date")
+    fmt_table(mb, {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
+                   "adjusted": "Adjusted Value", "share": "Share"},
               {"Multiplier": "{:.1f}", "Metric Value": "{:,.0f}", "Adjusted Value": "{:,.1f}", "Share": "{:.1%}"})
 
 
@@ -313,7 +333,6 @@ def quarter_table(table, info, with_cluster=True):
 
 
 def page_my_cluster(user):
-    st.title("My Cluster")
     df = fact()
     branches = branch_list()
     row = branches[branches["branch_code"] == user["branch_code"]]
@@ -327,25 +346,27 @@ def page_my_cluster(user):
     mine = view[view["branch_code"] == user["branch_code"]].iloc[0]
     clusters = k.cluster_summary(table)
     crow = clusters[clusters["cluster"] == cluster].iloc[0]
-    st.caption(f"{cluster}, {info['label']} to date: {info['start']:%d %b} to {info['end']:%d %b %Y}. "
-               f"Program Rank is counted across all {info['branches']} branches. "
-               "You see the figures of the branches in your cluster only.")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("My Adjusted Value, QTD", f"{mine['adjusted']:,.1f}" if pd.notna(mine["adjusted"]) else "No data")
-    c2.metric("My program rank", f"{mine['rank']:.0f} of {info['ranked']}" if pd.notna(mine["rank"]) else "No data")
-    c3.metric("My rank in the cluster", f"{mine['cluster_rank']:.0f} of {int(crow['reporting'])}"
-              if pd.notna(mine["cluster_rank"]) else "No data")
-    c4.metric("Cluster rank", f"{crow['cluster_rank']:.0f} of {int(clusters['cluster_rank'].notna().sum())}"
-              if pd.notna(crow["cluster_rank"]) else "No data")
-    st.subheader(f"{cluster} branches, {info['label']} to date")
-    quarter_table(view, info, with_cluster=False)
+    title_band(f"My Cluster: {cluster}",
+               f"{info['label']} to date, {info['start']:%d %b} to {info['end']:%d %b %Y} &nbsp;|&nbsp; "
+               f"Program Rank is counted across all {info['branches']} branches")
+    tiles([("My Adjusted Value, QTD", f"{mine['adjusted']:,.1f}" if pd.notna(mine["adjusted"]) else "No data",
+            mine["branch"], BLUE),
+           ("My program rank", f"{mine['rank']:.0f} of {info['ranked']}" if pd.notna(mine["rank"]) else "No data",
+            "All branches", BLUE),
+           ("My rank in the cluster", f"{mine['cluster_rank']:.0f} of {int(crow['reporting'])}"
+            if pd.notna(mine["cluster_rank"]) else "No data", cluster, BLUE),
+           ("Cluster rank", f"{crow['cluster_rank']:.0f} of {int(clusters['cluster_rank'].notna().sum())}"
+            if pd.notna(crow["cluster_rank"]) else "No data", "Among clusters", BLUE)])
     have = view.dropna(subset=["rank"])
     if len(have):
-        st.bar_chart(have.set_index("branch")["adjusted"])
+        with panel("mc_bar", f"{cluster}: Adjusted Value by Branch, {info['label']} to date"):
+            hbar(have[["branch", "adjusted"]], "branch", "adjusted", "Branch")
+    section_band(f"{cluster} branches, {info['label']} to date")
+    quarter_table(view, info, with_cluster=False)
+    st.caption("You see the figures of the branches in your cluster only.")
 
 
 def page_quarter_ranking(user):
-    st.title("Quarter Ranking")
     df = fact()
     branches = branch_list()
     c1, c2 = st.columns(2)
@@ -353,26 +374,34 @@ def page_quarter_ranking(user):
     table, info = k.quarter_ranking(df, as_of, branches)
     clusters = k.cluster_summary(table)
     pick = c2.selectbox("Cluster", ["All clusters"] + sorted(table["cluster"].dropna().unique()))
-    st.caption(f"{info['label']} to date: {info['start']:%d %b} to {info['end']:%d %b %Y}. "
-               f"Program Rank is counted across all {info['branches']} branches. "
-               f"Previous figures are for the full {info['prev_label']}.")
+    title_band("Quarter Ranking",
+               f"{info['label']} to date, {info['start']:%d %b} to {info['end']:%d %b %Y} &nbsp;|&nbsp; "
+               f"previous figures are for the full {info['prev_label']}")
     top = table.dropna(subset=["rank"])
     topc = clusters.dropna(subset=["cluster_rank"])
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Adjusted Value, QTD", f"{top['adjusted'].sum():,.1f}")
-    m2.metric("Top branch", top.iloc[0]["branch"] if len(top) else "No data")
-    m3.metric("Top cluster", topc.iloc[0]["cluster"] if len(topc) else "No data")
-    m4.metric("Branches reporting", f"{info['ranked']} of {info['branches']}")
-    st.subheader("Clusters")
+    tiles([("Adjusted Value, QTD", f"{top['adjusted'].sum():,.1f}", "All branches", BLUE),
+           ("Top branch", top.iloc[0]["branch"] if len(top) else "No data",
+            f"{top.iloc[0]['adjusted']:,.1f}" if len(top) else "", BLUE),
+           ("Top cluster", topc.iloc[0]["cluster"] if len(topc) else "No data",
+            f"{topc.iloc[0]['adjusted']:,.1f}" if len(topc) else "", BLUE),
+           ("Branches reporting", f"{info['ranked']} of {info['branches']}", "This quarter",
+            GREEN if info["ranked"] == info["branches"] else AMBER)])
+    view = table if pick == "All clusters" else k.cluster_view(table, pick)
+    shown = view.dropna(subset=["rank"])
+    if len(top):
+        g1, g2 = st.columns([3, 2])
+        with g1, panel("qr_branch", "Adjusted Value by Branch" if pick == "All clusters" else f"{pick}: by Branch"):
+            if len(shown):
+                hbar(shown[["branch", "adjusted"]], "branch", "adjusted", "Branch")
+        with g2, panel("qr_cluster", "Share by Cluster"):
+            donut(topc[["cluster", "adjusted"]], "cluster", "adjusted", "Cluster")
+    section_band("Clusters")
     fmt_table(clusters, {"cluster_rank": "Rank", "cluster": "Cluster", "adjusted": "Adjusted Value, QTD",
                          "share": "Share of Program", "avg_per_branch": "Avg per Branch",
                          "reporting": "Branches Reporting", "top_branch": "Top Branch", "best_rank": "Best Program Rank"},
               {"Rank": "{:.0f}", "Adjusted Value, QTD": "{:,.1f}", "Share of Program": "{:.1%}",
                "Avg per Branch": "{:,.1f}", "Branches Reporting": "{:.0f}", "Best Program Rank": "{:.0f}"})
-    if len(topc):
-        st.bar_chart(topc.set_index("cluster")["adjusted"])
-    st.subheader("Branches" if pick == "All clusters" else f"{pick} branches")
-    view = table if pick == "All clusters" else k.cluster_view(table, pick)
+    section_band("Branches" if pick == "All clusters" else f"{pick} branches")
     quarter_table(view, info)
     st.download_button("Download quarter ranking as CSV", view.to_csv(index=False), "quarter_ranking.csv", "text/csv")
 
@@ -413,9 +442,42 @@ def chart(data, spec):
     st.vega_lite_chart(data, spec, use_container_width=True)
 
 
+def hbar(data, cat, val, cat_title, val_title="Adjusted Value"):
+    """Horizontal bars, highest first."""
+    chart(data, {"mark": {"type": "bar", "color": BLUE, "cornerRadiusEnd": 2},
+                 "encoding": {"y": {"field": cat, "type": "nominal", "sort": "-x", "title": None},
+                              "x": {"field": val, "type": "quantitative", "title": val_title},
+                              "tooltip": [{"field": cat, "title": cat_title},
+                                          {"field": val, "title": val_title, "format": ",.1f"}]},
+                 "height": {"step": 20}})
+
+
+def vbar(data, cat, val, cat_title, val_title="Adjusted Value"):
+    """Upright bars in the order given."""
+    chart(data, {"mark": {"type": "bar", "color": BLUE},
+                 "encoding": {"x": {"field": cat, "type": "ordinal", "sort": None, "title": cat_title,
+                                    "axis": {"labelAngle": 0}},
+                              "y": {"field": val, "type": "quantitative", "title": val_title},
+                              "tooltip": [{"field": cat, "title": cat_title},
+                                          {"field": val, "title": val_title, "format": ",.1f"}]},
+                 "height": 280})
+
+
+def donut(data, cat, val, cat_title, val_title="Adjusted Value", colours=None):
+    chart(data, {"mark": {"type": "arc", "innerRadius": 70},
+                 "encoding": {"theta": {"field": val, "type": "quantitative", "stack": True},
+                              "color": {"field": cat, "type": "nominal", "scale": {"range": colours or CLUSTER_COLOURS},
+                                        "legend": {"title": None, "orient": "bottom"}},
+                              "order": {"field": val, "type": "quantitative", "sort": "descending"},
+                              "tooltip": [{"field": cat, "title": cat_title},
+                                          {"field": val, "title": val_title, "format": ",.1f"}]},
+                 "height": 320})
+
+
 def colour_status(value):
-    return {"Submitted": f"color: {GREEN}; font-weight: 600", "Partial": f"color: {AMBER}; font-weight: 600",
-            "Not submitted": f"color: {RED}; font-weight: 600"}.get(value, "")
+    good, warn, bad = (f"color: {c}; font-weight: 600" for c in (GREEN, AMBER, RED))
+    return {"Submitted": good, "OK": good, "Partial": warn, "Partial days": warn, "Behind": warn,
+            "Not submitted": bad, "No data": bad}.get(value, "")
 
 
 def page_main_dashboard(user):
@@ -501,6 +563,14 @@ def page_main_dashboard(user):
                             {"field": "total", "title": "Running total", "format": ",.1f"}]},
             "height": 280})
 
+    section_band("Ranking, month to date")
+    fmt_table(table,
+              {"rank": "Rank", "branch": "Branch", "cluster": "Cluster", "adjusted": "Adjusted Value",
+               "prev_adjusted": "Previous Month", "change_pct": "Change %", "prev_rank": "Previous Rank",
+               "rank_change": "Rank Change", "days_reported": "Days Reported"},
+              {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Previous Month": "{:,.1f}", "Change %": "{:+.1%}",
+               "Previous Rank": "{:.0f}", "Rank Change": "{:+.0f}", "Days Reported": "{:.0f}"})
+
     if user["role"] in ("manager", "owner"):
         day = k.last_working_day(as_of)
         sub = k.submission_check(db, day)
@@ -515,17 +585,8 @@ def page_main_dashboard(user):
         else:
             section_band(f"All branches submitted for {day:%a %d %b %Y}", GREEN)
 
-    section_band("Ranking, month to date")
-    fmt_table(table,
-              {"rank": "Rank", "branch": "Branch", "cluster": "Cluster", "adjusted": "Adjusted Value",
-               "prev_adjusted": "Previous Month", "change_pct": "Change %", "prev_rank": "Previous Rank",
-               "rank_change": "Rank Change", "days_reported": "Days Reported"},
-              {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Previous Month": "{:,.1f}", "Change %": "{:+.1%}",
-               "Previous Rank": "{:.0f}", "Rank Change": "{:+.0f}", "Days Reported": "{:.0f}"})
-
 
 def page_kpi_dashboard(user):
-    st.title("KPI Dashboard")
     df = fact()
     branches = branch_list()
     latest = k.latest_data_date(df)
@@ -533,30 +594,38 @@ def page_kpi_dashboard(user):
     start = c1.date_input("From", value=latest.replace(day=1))
     end = c2.date_input("To", value=latest)
     metric = c3.selectbox("Metric", ["All metrics"] + list(k.get_metrics(db)["metric"]))
-    st.caption("Figures refresh within 2 minutes, and at once after you save or import.")
     if start > end:
         st.error("From must be on or before To.")
         return
+    title_band("KPI Dashboard", f"{start:%d %b %Y} to {end:%d %b %Y} &nbsp;|&nbsp; {metric}")
     d = df if metric == "All metrics" else df[df["metric"] == metric]
     r = k.ranking(d, start, end, branches)
     have = r.dropna(subset=["rank"])
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Adjusted Value", f"{have['adjusted'].sum():,.1f}")
-    m2.metric("Top branch", have.iloc[0]["branch"] if len(have) else "No data")
-    m3.metric("Lowest branch", have.iloc[-1]["branch"] if len(have) else "No data")
-    if True:
-        fmt_table(r, {"rank": "Rank", "branch": "Branch", "adjusted": "Adjusted Value", "share": "Share of Company",
-                      "days_reported": "Days Reported", "avg_per_day": "Avg per Day", "last_date": "Last Reported"},
-                  {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Share of Company": "{:.1%}",
-                   "Days Reported": "{:.0f}", "Avg per Day": "{:,.1f}", "Last Reported": "{:%d %b %Y}"})
+    tiles([("Adjusted Value", f"{have['adjusted'].sum():,.1f}", metric, BLUE),
+           ("Top branch", have.iloc[0]["branch"] if len(have) else "No data",
+            f"{have.iloc[0]['adjusted']:,.1f}" if len(have) else "", GREEN),
+           ("Lowest branch", have.iloc[-1]["branch"] if len(have) else "No data",
+            f"{have.iloc[-1]['adjusted']:,.1f}" if len(have) else "", AMBER),
+           ("Average per branch", f"{have['adjusted'].mean():,.1f}" if len(have) else "n/a",
+            f"{len(have)} of {len(branches)} reporting", BLUE)])
     if len(have):
-        st.subheader("Adjusted Value by branch")
-        st.bar_chart(have.set_index("branch")["adjusted"])
+        daily = k.daily_breakdown(d, start, end)
+        g1, g2 = st.columns([3, 2])
+        with g1, panel("kd_branch", "Adjusted Value by Branch"):
+            hbar(have[["branch", "adjusted"]], "branch", "adjusted", "Branch")
+        with g2, panel("kd_daily", "Daily Adjusted Value"):
+            vbar(daily.assign(day=daily["date"].dt.strftime("%d %b"))[["day", "adjusted"]], "day", "adjusted", "Date")
+    section_band("Ranking for the period")
+    fmt_table(r, {"rank": "Rank", "branch": "Branch", "cluster": "Cluster", "adjusted": "Adjusted Value",
+                  "share": "Share of Company", "days_reported": "Days Reported", "avg_per_day": "Avg per Day",
+                  "last_date": "Last Reported"},
+              {"Rank": "{:.0f}", "Adjusted Value": "{:,.1f}", "Share of Company": "{:.1%}",
+               "Days Reported": "{:.0f}", "Avg per Day": "{:,.1f}", "Last Reported": "{:%d %b %Y}"})
     st.download_button("Download ranking as CSV", r.to_csv(index=False), "ranking.csv", "text/csv")
+    st.caption("Figures refresh within 2 minutes, and at once after you save or import.")
 
 
 def page_drill_down(user):
-    st.title("Drill-down")
     df = fact()
     branches = branch_list()
     latest = k.latest_data_date(df)
@@ -564,41 +633,86 @@ def page_drill_down(user):
     code = c1.selectbox("Branch", branches["branch_code"], format_func=branch_label(branches))
     start = c2.date_input("From", value=latest.replace(day=1), key="dd_from")
     end = c3.date_input("To", value=latest, key="dd_to")
+    name = branches.set_index("branch_code")["branch"][code]
+    title_band(f"Drill-down: {name}", f"{code} &nbsp;|&nbsp; {start:%d %b %Y} to {end:%d %b %Y}")
     d = k.daily_breakdown(df, start, end, code)
     if not len(d):
         st.info("No entries for this branch in the selected dates.")
         return
-    st.metric("Adjusted Value", f"{d['adjusted'].sum():,.1f}")
-    st.subheader("By metric")
-    fmt_table(k.metric_breakdown(df, start, end, code),
-              {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
-               "adjusted": "Adjusted Value", "share": "Share"},
+    mb = k.metric_breakdown(df, start, end, code)
+    best = d.loc[d["adjusted"].idxmax()]
+    tiles([("Adjusted Value", f"{d['adjusted'].sum():,.1f}", name, BLUE),
+           ("Days reported", f"{len(d)}", "In the period", BLUE),
+           ("Average per day", f"{d['adjusted'].mean():,.1f}", "Adjusted Value", BLUE),
+           ("Best day", f"{best['date']:%d %b}", f"{best['adjusted']:,.1f}", GREEN),
+           ("Top metric", mb.iloc[0]["metric"], f"{mb.iloc[0]['share']:.0%} of the total", BLUE)])
+    g1, g2 = st.columns(2)
+    with g1, panel("dd_daily", "Daily Adjusted Value"):
+        vbar(d.assign(day=d["date"].dt.strftime("%d %b"))[["day", "adjusted"]], "day", "adjusted", "Date")
+    with g2, panel("dd_metric", "Adjusted Value by Metric"):
+        hbar(mb[["metric", "adjusted"]], "metric", "adjusted", "Metric")
+    section_band("By metric")
+    fmt_table(mb, {"metric": "Metric", "multiplier": "Multiplier", "metric_value": "Metric Value",
+                   "adjusted": "Adjusted Value", "share": "Share"},
               {"Multiplier": "{:.1f}", "Metric Value": "{:,.0f}", "Adjusted Value": "{:,.1f}", "Share": "{:.1%}"})
-    st.subheader("By day")
-    st.bar_chart(d.set_index("date")["adjusted"])
+
+
+STATUS_COLOURS = {"Submitted": GREEN, "OK": GREEN, "Partial": AMBER, "Partial days": AMBER, "Behind": AMBER,
+                  "Not submitted": RED, "No data": RED}
+
+
+def status_donut(counts, title):
+    """counts: table with columns status and branches."""
+    order = [x for x in STATUS_COLOURS if x in set(counts["status"])]
+    chart(counts, {"mark": {"type": "arc", "innerRadius": 70},
+                   "encoding": {"theta": {"field": "branches", "type": "quantitative", "stack": True},
+                                "color": {"field": "status", "type": "nominal",
+                                          "scale": {"domain": order, "range": [STATUS_COLOURS[x] for x in order]},
+                                          "legend": {"title": None, "orient": "bottom"}},
+                                "tooltip": [{"field": "status", "title": "Status"},
+                                            {"field": "branches", "title": title}]},
+                   "height": 300})
 
 
 def page_submission_check(user):
-    st.title("Submission Check")
     day = st.date_input("Check date", value=k.last_working_day(), max_value=date.today())
     s = k.submission_check(db, day)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Submitted", int((s["status"] == "Submitted").sum()))
-    c2.metric("Partial", int((s["status"] == "Partial").sum()))
-    c3.metric("Not submitted", int((s["status"] == "Not submitted").sum()))
+    n = {x: int((s["status"] == x).sum()) for x in ("Submitted", "Partial", "Not submitted")}
+    title_band("Submission Check", f"{day:%A %d %b %Y}")
+    tiles([("Submitted", n["Submitted"], f"of {len(s)} branches", GREEN),
+           ("Partial", n["Partial"], "Some metrics missing", AMBER),
+           ("Not submitted", n["Not submitted"], "No entries for the day", RED),
+           ("Metrics expected", int(s["expected"].iloc[0]) if len(s) else 0, "Per branch", BLUE)])
+    g1, g2 = st.columns([2, 3])
+    with g1, panel("sc_status", "Branches by Status"):
+        status_donut(s.groupby("status", as_index=False).size().rename(columns={"size": "branches"}), "Branches")
+    with g2, panel("sc_entered", "Metrics Entered by Branch"):
+        hbar(s[["branch", "entered"]], "branch", "entered", "Branch", "Metrics entered")
+    missing = n["Partial"] + n["Not submitted"]
+    section_band(f"{missing} branch(es) to follow up" if missing else "All branches submitted", RED if missing else GREEN)
     fmt_table(s.sort_values(["status", "branch_code"]),
               {"branch_code": "Branch Code", "branch": "Branch", "entered": "Metrics Entered",
-               "expected": "Expected", "status": "Status"})
+               "expected": "Expected", "status": "Status"}, status="Status")
     st.caption("A branch on holiday shows Not submitted. Confirm holidays before following up.")
 
 
 def page_data_quality(user):
-    st.title("Data Quality")
-    fmt_table(k.data_quality(db),
-              {"branch_code": "Branch Code", "branch": "Branch", "first_date": "First Date", "last_date": "Last Date",
-               "days_reported": "Days Reported", "partial_days": "Partial Days", "status": "Status"})
-    st.caption("OK: up to date and complete. Behind: last date is older than other branches. "
-               "Partial days: some days have fewer than all metrics. No data: no entries yet.")
+    q = k.data_quality(db)
+    n = q["status"].value_counts()
+    title_band("Data Quality", "First and last date, days reported and gaps for every branch")
+    tiles([("OK", int(n.get("OK", 0)), "Up to date and complete", GREEN),
+           ("Behind", int(n.get("Behind", 0)), "Last date is older than others", AMBER),
+           ("Partial days", int(n.get("Partial days", 0)), "Some days are incomplete", AMBER),
+           ("No data", int(n.get("No data", 0)), "No entries yet", RED)])
+    g1, g2 = st.columns([2, 3])
+    with g1, panel("dq_status", "Branches by Status"):
+        status_donut(q.groupby("status", as_index=False).size().rename(columns={"size": "branches"}), "Branches")
+    with g2, panel("dq_days", "Days Reported by Branch"):
+        hbar(q[["branch", "days_reported"]], "branch", "days_reported", "Branch", "Days reported")
+    section_band("All branches")
+    fmt_table(q, {"branch_code": "Branch Code", "branch": "Branch", "first_date": "First Date",
+                  "last_date": "Last Date", "days_reported": "Days Reported", "partial_days": "Partial Days",
+                  "status": "Status"}, status="Status")
 
 
 def page_users(user):
@@ -1017,24 +1131,32 @@ def main():
         st.query_params["pg"] = page
     with st.container(key="menu_card"):
         menus = [n for n in secs if n != "Home"]
-        cols = st.columns([2.4, 0.9] + [1.5] * len(menus) + [max(0.5, 5.2 - 1.5 * len(menus)), 2.2, 1.1],
+        cols = st.columns([2.6, 0.8] + [1.4] * len(menus) + [max(0.5, 5.4 - 1.4 * len(menus)), 2.0],
                           vertical_alignment="center")
-        cols[0].markdown(f'<div class="brand">{PORTAL_NAME}</div>', unsafe_allow_html=True)
-        cols[1].button("Home", key="nav_home", type="tertiary", on_click=go_to, args=("Home", "Home"))
+        cols[0].markdown(f'<div class="brand"><span class="dot"></span>{PORTAL_NAME}</div>', unsafe_allow_html=True)
+        with cols[1].container(key="navsec_Home"):
+            st.button("Home", key="nav_home", type="tertiary", on_click=go_to, args=("Home", "Home"))
         for i, name in enumerate(menus):
-            with cols[2 + i].popover(name):
-                for p in secs[name]:
-                    st.button(p, key=f"nav_{name}_{p}", type="tertiary", on_click=go_to, args=(name, p))
-        with cols[-2].popover(user["full_name"]):
-            st.caption(f"Role: {user['role']}")
-            for p in secs["Home"][1:]:
-                st.button(p, key=f"nav_Home_{p}", type="tertiary", on_click=go_to, args=("Home", p))
-            out = st.button("Sign out", key="nav_sign_out")
-        trail = ["Home"] if section == "Home" and page == "Home" else (
-            ["Home", page] if section == "Home" else ["Home", section, page])
-        st.markdown('<div class="crumb">' + " &nbsp;/&nbsp; ".join(
+            with cols[2 + i].container(key="navsec_" + name.replace(" ", "_")):
+                with st.popover(name):
+                    for p in secs[name]:
+                        st.button(p, key=f"nav_{name}_{p}", type="tertiary", on_click=go_to, args=(name, p))
+        with cols[-1].container(key="navsec_user"):
+            with st.popover(user["full_name"]):
+                st.caption(f"Role: {user['role']}")
+                for p in secs["Home"][1:]:
+                    st.button(p, key=f"nav_Home_{p}", type="tertiary", on_click=go_to, args=("Home", p))
+                out = st.button("Sign out", key="nav_sign_out")
+    # the open section is underlined in the bar; the breadcrumb sits in its own strip below
+    trail = ["Home"] if section == "Home" and page == "Home" else (
+        ["Home", page] if section == "Home" else ["Home", section, page])
+    st.markdown(
+        f'<style>div[class*="st-key-navsec_{section.replace(" ", "_")}"] button {{'
+        'border-bottom: 3px solid #5BB0F0 !important; border-radius: 0 !important;}</style>'
+        '<div class="crumb">' + '<i>/</i>'.join(
             f"<b>{t}</b>" if i == len(trail) - 1 else f"<span>{t}</span>" for i, t in enumerate(trail)) + "</div>",
-            unsafe_allow_html=True)
+        unsafe_allow_html=True)
+    if True:
         if out:
             k.end_session(db, st.session_state.get("token"))
             st.session_state.pop("user", None)
