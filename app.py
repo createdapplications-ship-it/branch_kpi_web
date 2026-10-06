@@ -733,7 +733,7 @@ def page_users(user):
         c1, c2 = st.columns(2)
         username = c1.text_input("Username (for example branch01 or a name)")
         full_name = c2.text_input("Full name")
-        role = c1.selectbox("Role (employee = Attendance only)", list(k.ROLES))
+        role = c1.selectbox("Role (employee = Attendance only, branch = can enter KPI data)", list(k.ROLES))
         code = c2.selectbox("Branch (needed for the branch role, optional for others)",
                             ["(none)"] + list(branches["branch_code"]))
         add = st.form_submit_button("Create user")
@@ -744,6 +744,24 @@ def page_users(user):
                                  by=user["username"])
             st.success(f"User {name} created. Temporary password: {temp}")
             st.caption("Give this password to the user. It is shown only once. They must change it at first sign-in.")
+        except ValueError as err:
+            st.error(str(err))
+
+    st.subheader("Change a user's role or branch")
+    st.caption("employee: Attendance only. branch: Attendance, plus Daily Entry, My Branch and My Cluster for its "
+               "own branch. manager: dashboards for all branches. owner: everything.")
+    with st.form("change_role"):
+        r1, r2, r3 = st.columns(3)
+        who = r1.selectbox("User to change", list(users["username"]))
+        new_role = r2.selectbox("New role", list(k.ROLES), index=list(k.ROLES).index("branch"))
+        new_code = r3.selectbox("New branch", ["(none)"] + list(branches["branch_code"]))
+        change = st.form_submit_button("Change role")
+    if change:
+        try:
+            if who == user["username"]:
+                raise ValueError("You cannot change your own role.")
+            k.set_role(db, who, new_role, None if new_code == "(none)" else new_code, by=user["username"])
+            st.success(f"{who} is now {new_role}. They must sign in again.")
         except ValueError as err:
             st.error(str(err))
 

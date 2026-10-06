@@ -307,6 +307,26 @@ def reset_password(db, username, by):
     return temp
 
 
+def set_role(db, username, role, branch_code, by):
+    """Owner action. Change a user's role and branch. The user is signed out so the change applies at once."""
+    if role not in ROLES:
+        raise ValueError("Unknown role.")
+    row = db.one("SELECT role FROM users WHERE username = ?", (username,))
+    if not row:
+        raise ValueError("User not found.")
+    branch_code = (branch_code or "").strip() or None
+    if role == "branch" and not branch_code:
+        raise ValueError("A branch user needs a branch.")
+    if branch_code and not db.one("SELECT COUNT(*) FROM branches WHERE branch_code = ?", (branch_code,))[0]:
+        raise ValueError(f"{branch_code} is not in the branch list.")
+    owners = db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0]
+    if row[0] == "owner" and role != "owner" and owners <= 1:
+        raise ValueError("At least one active owner is required.")
+    db.run([("UPDATE users SET role = ?, branch_code = ? WHERE username = ?", (role, branch_code, username))])
+    end_user_sessions(db, username)
+    log(db, by, "set_role", f"{username}: {row[0]} -> {role}{' ' + branch_code if branch_code else ''}")
+
+
 def set_active(db, username, active, by):
     if not active:
         row = db.one("SELECT role FROM users WHERE username = ?", (username,))
