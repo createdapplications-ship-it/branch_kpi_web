@@ -143,6 +143,9 @@ def schema(is_pg):
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT)""",
         "CREATE TABLE IF NOT EXISTS audit_log (at TEXT, username TEXT, action TEXT, detail TEXT)",
+        """CREATE TABLE IF NOT EXISTS user_access (
+            username TEXT NOT NULL REFERENCES users(username), module TEXT NOT NULL, level TEXT NOT NULL,
+            updated_by TEXT, updated_at TEXT, PRIMARY KEY (username, module))""",
         """CREATE TABLE IF NOT EXISTS sessions (
             token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, created_at TEXT, expires_at TEXT NOT NULL)""",
         "CREATE TABLE IF NOT EXISTS login_attempts (username TEXT NOT NULL, at TEXT NOT NULL, ok INTEGER NOT NULL)",
@@ -338,6 +341,65 @@ def set_active(db, username, active, by):
     if not active:
         end_user_sessions(db, username)
     log(db, by, "activate_user" if active else "deactivate_user", username)
+
+
+# ---------------------------------------------------------------- module access
+# By default the role decides what a person can open. The owner can change this per person and per module:
+# give a module the role does not have, give a different level, or take a module away.
+# A level is the role whose pages and rights the person gets inside that module only.
+ACCESS_LEVELS = {
+    "Attendance": [("Own records", "employee"), ("Supervisor", "supervisor"), ("HR", "hr"), ("Manager", "manager")],
+    "Branch KPI": [("Branch entry", "branch"), ("Manager view", "manager")],
+    "HR": [("HR staff", "hr")],
+    "Payroll": [("Payroll staff", "payroll")],
+    "CRM": [("Own clients", "employee"), ("Supervisor", "supervisor"), ("Manager", "manager")],
+}
+NO_ACCESS = "none"
+
+
+def level_label(module, level):
+    if level == NO_ACCESS:
+        return "No access"
+    return dict((r, l) for l, r in ACCESS_LEVELS.get(module, [])).get(level, level)
+
+
+def get_access(db, username):
+    """The owner's changes for one person: {module: level}. A module that is not listed follows the role."""
+    rows = db.query("SELECT module, level FROM user_access WHERE username = ?", (username,))
+    return dict(zip(rows["module"], rows["level"]))
+
+
+def all_access(db):
+    return db.query("SELECT username, module, level, updated_by, updated_at FROM user_access ORDER BY username, module")
+
+
+def set_access(db, username, module, level, by):
+    """Owner action. level: a role from ACCESS_LEVELS, NO_ACCESS to take the module away, or None to go back to the role."""
+    if module not in ACCESS_LEVELS:
+        raise ValueError("Unknown module.")
+    row = db.one("SELECT role, branch_code FROM users WHERE username = ?", (username,))
+    if not row:
+        raise ValueError("User not found.")
+    if row[0] == "owner":
+        raise ValueError("An owner always has full access. Change the role first if needed.")
+    if username == by:
+        raise ValueError("You cannot change your own access.")
+    if level is not None and level != NO_ACCESS:
+        if level not in [r for _, r in ACCESS_LEVELS[module]]:
+            raise ValueError(f"That level is not available for {module}.")
+        if level in BRANCH_ROLES and not row[1]:
+            raise ValueError(f"{level_label(module, level)} needs a branch. Give the user a branch first.")
+    db.run([("DELETE FROM user_access WHERE username = ? AND module = ?", (username, module))]
+           + ([("INSERT INTO user_access (username, module, level, updated_by, updated_at) VALUES (?,?,?,?,?)",
+                (username, module, level, by, now()))] if level is not None else []))
+    log(db, by, "set_access", f"{username}: {module} -> {'role default' if level is None else level_label(module, level)}")
+
+
+def reset_access(db, username, by):
+    n = db.one("SELECT COUNT(*) FROM user_access WHERE username = ?", (username,))[0]
+    db.run([("DELETE FROM user_access WHERE username = ?", (username,))])
+    log(db, by, "reset_access", username)
+    return n
 
 
 # ---------------------------------------------------------------- sessions

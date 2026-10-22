@@ -30,19 +30,38 @@ div[class*="st-key-card_"], div[class*="st-key-menu_card"] {{
     box-shadow: 0 1px 3px rgba(0,0,0,.08);}}
 /* top bar: dark band with the portal name and drop-down menus. Stays at the top while the page scrolls */
 div[class*="st-key-menu_card"] {{position: sticky; top: 3.4rem; z-index: 90; background: #1F2A44; border: none;
-    border-radius: 8px; padding: .35rem 1.2rem; box-shadow: 0 3px 10px rgba(0,0,0,.22); gap: 0;}}
+    border-radius: 10px; padding: .3rem 1rem; box-shadow: 0 3px 10px rgba(0,0,0,.22); gap: 0;}}
+/* one line: every item takes only the width it needs, the spacer pushes the name to the right.
+   On a narrow screen the bar scrolls sideways instead of wrapping. */
+div[class*="st-key-menu_card"] [data-testid="stHorizontalBlock"] {{flex-wrap: nowrap !important; gap: .15rem;
+    align-items: center; overflow-x: auto; scrollbar-width: none;}}
+div[class*="st-key-menu_card"] [data-testid="stHorizontalBlock"]::-webkit-scrollbar {{display: none;}}
+div[class*="st-key-menu_card"] [data-testid="stColumn"] {{flex: 0 0 auto !important; width: auto !important;
+    min-width: 0 !important;}}
+div[class*="st-key-menu_card"] [data-testid="stColumn"]:has(.st-key-nav_spacer) {{flex: 1 1 auto !important;}}
+div[class*="st-key-menu_card"] [data-testid="stColumn"]:first-child {{margin-right: 1.4rem;}}
 div[class*="st-key-menu_card"] [data-testid="stMarkdownContainer"] {{margin: 0;}}
 div[class*="st-key-menu_card"] [data-testid="stMarkdownContainer"] p {{margin: 0;}}
-div[class*="st-key-menu_card"] .brand {{display: flex; align-items: center; gap: .55rem; font-size: 1.15rem;
-    font-weight: 700; color: #FFFFFF; white-space: nowrap; line-height: 2.2rem;}}
-div[class*="st-key-menu_card"] .brand .dot {{width: .8rem; height: .8rem; border-radius: 2px; background: #5BB0F0;
-    display: inline-block;}}
+div[class*="st-key-menu_card"] .brand {{display: flex; align-items: center; gap: .55rem; font-size: 1.1rem;
+    font-weight: 700; color: #FFFFFF; white-space: nowrap; line-height: 2.4rem;}}
+div[class*="st-key-menu_card"] .brand .dot, .login-head .dot {{width: .8rem; height: .8rem; border-radius: 3px;
+    display: inline-block; background: linear-gradient(135deg, #1C7C8C, #0F6CBD 40%, #7A5AA6 60%, #2E8B57 80%, #B5651D);}}
 div[class*="st-key-menu_card"] button, div[class*="st-key-menu_card"] button p,
 div[class*="st-key-menu_card"] button svg {{color: #FFFFFF !important; fill: #FFFFFF;}}
-div[class*="st-key-menu_card"] button {{border: none !important; background: transparent !important;
-    font-size: .85rem; padding: .2rem .45rem; min-height: 1.9rem;}}
-div[class*="st-key-menu_card"] button p {{font-size: .85rem;}}
+div[class*="st-key-menu_card"] button {{border: none !important; background: transparent !important; white-space: nowrap;
+    font-size: .85rem; padding: .25rem .7rem; min-height: 2rem; border-radius: 6px !important; width: auto;}}
+div[class*="st-key-menu_card"] button p {{font-size: .85rem; white-space: nowrap;}}
 div[class*="st-key-menu_card"] button:hover {{background: rgba(255,255,255,.12) !important;}}
+div[class*="st-key-navsec_user"] {{border-left: 1px solid rgba(255,255,255,.18); padding-left: .6rem;}}
+div[class*="st-key-navsec_user"] button p {{color: #C9D3E3 !important;}}
+@media (max-width: 640px) {{
+    div[class*="st-key-menu_card"] .brand .name {{display: none;}}
+    div[class*="st-key-menu_card"] [data-testid="stColumn"]:first-child {{margin-right: .4rem;}}
+}}
+/* sign-in: a narrow card in the middle of the page */
+div[class*="st-key-login_box"] {{max-width: 26rem; margin: 4rem auto 0; background: #FFFFFF; border: 1px solid #E1E1E1;
+    border-top: 6px solid #1F2A44; border-radius: 10px; padding: 1.6rem 1.8rem; box-shadow: 0 2px 8px rgba(0,0,0,.08);}}
+.login-head {{display: flex; align-items: center; gap: .55rem; font-weight: 700; color: #1F2A44; font-size: 1rem;}}
 div[data-testid="stPopoverBody"] {{min-width: 13rem; padding: .6rem .7rem;}}
 div[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] {{gap: .1rem;}}
 div[data-testid="stPopoverBody"] button[kind="tertiary"] {{justify-content: flex-start; width: 100%; color: #1B1B1B;
@@ -169,14 +188,33 @@ CRM_PAGES = {"employee": ["My Clients", "Call List"], "branch": ["My Clients", "
              "owner": ["My Clients", "Call List", "All Clients", "Assign Clients", "CRM Report"]}
 
 
-def sections_for(role):
-    """The sections a role can open, and the pages in each."""
-    out = {"Home": ["Home", "My Payslips", "My Account"] + (["Users"] if role == "owner" else []),
-           "Attendance": ATT_PAGES[role]}
-    for name, pages in (("Branch KPI", KPI_PAGES), ("HR", HR_PAGES), ("Payroll", PAY_PAGES), ("CRM", CRM_PAGES)):
-        if pages.get(role):
-            out[name] = pages[role]
+MODULE_PAGES = {"Attendance": ATT_PAGES, "Branch KPI": KPI_PAGES, "HR": HR_PAGES, "Payroll": PAY_PAGES, "CRM": CRM_PAGES}
+
+
+def module_roles(role, access=None, branch_code=None):
+    """The role used inside each module: the person's own role, unless the owner changed it for that module."""
+    out = {}
+    for name, pages in MODULE_PAGES.items():
+        level = role if role == "owner" else (access or {}).get(name, role)
+        if level == k.NO_ACCESS or (level in k.BRANCH_ROLES and not branch_code):
+            continue
+        if pages.get(level):
+            out[name] = level
     return out
+
+
+def sections_for(role, access=None, branch_code="-"):
+    """The sections a person can open, and the pages in each."""
+    out = {"Home": ["Home", "My Payslips", "My Account"] + (["Users"] if role == "owner" else [])}
+    for name, level in module_roles(role, access, branch_code).items():
+        out[name] = MODULE_PAGES[name][level]
+    return out
+
+
+def user_sections(user):
+    access = {} if user["role"] == "owner" else k.get_access(db, user["username"])
+    return (sections_for(user["role"], access, user.get("branch_code")),
+            module_roles(user["role"], access, user.get("branch_code")))
 
 
 def go_to(section, page=None):
@@ -240,35 +278,26 @@ def choose(section):
     st.session_state["dest"] = section
 
 
-def module_cards(prefix, secs=None, on_click=choose):
-    """One card per module. secs=None (not signed in): every card opens the sign-in page.
-    With secs, a module the person cannot open says so instead of showing a button."""
-    rows = [MODULES[:3], MODULES[3:]]
-    for r, row in enumerate(rows):
+def module_cards(prefix, secs, on_click):
+    """One card for each module the person can open."""
+    mods = [m for m in MODULES if m[0] in secs]
+    if not mods:
+        st.info("Your account has no modules yet. Ask the owner to give you access.")
+    for i in range(0, len(mods), 3):
         cols = st.columns(3)
-        for col, (name, text, _) in zip(cols, row):
+        for col, (name, text, _) in zip(cols, mods[i:i + 3]):
             with col, card(f"mod_{_key(name)}_{prefix}"):
                 st.subheader(name)
                 st.write(text)
-                if secs is None or name in secs:
-                    st.button(f"Open {name}", key=f"{prefix}_open_{_key(name)}", type="primary",
-                              on_click=on_click, args=(name,))
-                else:
-                    st.caption("Your account does not have access. Ask the owner if you need it.")
-
-
-def landing_page():
-    """The open main page. No sign-in here. Each card leads to the sign-in page; access is checked after it."""
-    st.title(PORTAL_NAME)
-    st.caption("Choose where to go. You sign in with your own username and password. "
-               "Each person sees the modules their role allows.")
-    module_cards("land")
+                st.button(f"Open {name}", key=f"{prefix}_open_{_key(name)}", type="primary",
+                          on_click=on_click, args=(name,))
 
 
 def login_page():
-    dest = st.session_state.get("dest", "Home")
-    st.title(f"{dest}: sign in" if dest != "Home" else "Sign in")
-    st.caption("One account works for every module.")
+    """The first page of the portal. After sign-in the person sees only the modules they have access to."""
+    st.markdown(f'<div class="login-head"><span class="dot"></span>{PORTAL_NAME}</div>', unsafe_allow_html=True)
+    st.title("Sign in")
+    st.caption("Use your own username and password. You will see the modules your account has access to.")
     with st.form("login"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -287,8 +316,7 @@ def login_page():
             st.rerun()
         else:
             st.error("Wrong username or password, or the account is not active.")
-    st.caption("No account? Ask the owner to create one.")
-    st.button("Back to the main page", key="back_home", on_click=lambda: st.session_state.pop("dest", None))
+    st.caption("No account or forgot your password? Ask the owner.")
 
 
 def password_form(user, forced):
@@ -777,6 +805,51 @@ def page_data_quality(user):
                   "status": "Status"}, status="Status")
 
 
+def access_admin(user, users):
+    """Owner: give or take away each person's modules. Changes apply on the person's next click."""
+    st.subheader("Module access")
+    st.caption("By default the role decides what a person can open. Here you can give a module the role does not "
+               "have, give a different level inside one module, or take a module away. An owner always has full access.")
+    others = users[(users["role"] != "owner") & (users["active"].astype(int) == 1)]
+    if others.empty:
+        st.info("There are no other active users yet.")
+        return
+    changes = k.all_access(db)
+    rows = []
+    for _, u in others.iterrows():
+        over = dict(zip(changes.loc[changes["username"] == u["username"], "module"],
+                        changes.loc[changes["username"] == u["username"], "level"]))
+        roles = module_roles(u["role"], over, u["branch_code"])
+        row = {"User": u["username"], "Name": u["full_name"], "Role": u["role"]}
+        for m, _, _ in MODULES:
+            text = k.level_label(m, roles[m]) if m in roles else "No access"
+            row[m] = text + (" (changed)" if m in over else "")
+        rows.append(row)
+    xl_table(pd.DataFrame(rows))
+    a1, a2, a3, a4 = st.columns([2, 1.3, 1.5, 1], vertical_alignment="bottom")
+    who = a1.selectbox("User", list(others["username"]), key="acc_who",
+                       format_func=lambda n: f"{n} - {others.set_index('username').loc[n, 'full_name']}")
+    mod = a2.selectbox("Module", [m[0] for m in MODULES], key="acc_mod")
+    # the level list follows the module picked
+    lvl = a3.selectbox("Access", ["Role default", "No access"] + [lbl for lbl, _ in k.ACCESS_LEVELS[mod]],
+                       key=f"acc_lvl_{_key(mod)}")
+    save = a4.button("Save access", key="acc_save", type="primary")
+    if save:
+        try:
+            level = None if lvl == "Role default" else k.NO_ACCESS if lvl == "No access" else dict(k.ACCESS_LEVELS[mod]).get(lvl)
+            if lvl not in ("Role default", "No access") and level is None:
+                raise ValueError(f"{lvl} is not a level for {mod}. Pick the module, then the level.")
+            k.set_access(db, who, mod, level, user["username"])
+            st.success(f"{who}: {mod} is now {lvl.lower() if level is None else k.level_label(mod, level)}.")
+        except ValueError as err:
+            st.error(str(err))
+    r1, r2 = st.columns([2, 1])
+    back = r1.selectbox("Put one user back to their role's access", list(others["username"]), key="reset_who")
+    if r2.button("Reset access", key="reset_access"):
+        n = k.reset_access(db, back, user["username"])
+        st.success(f"{back}: {n} change(s) removed. Access now follows the role.")
+
+
 def page_users(user):
     st.title("Users")
     branches = branch_list()
@@ -824,6 +897,8 @@ def page_users(user):
             st.success(f"{who} is now {new_role}. They must sign in again.")
         except ValueError as err:
             st.error(str(err))
+
+    access_admin(user, users)
 
     st.subheader("Add many users from a file")
     st.caption("Upload a .csv with the columns Username, Full Name, Role, Branch. "
@@ -1015,7 +1090,7 @@ def page_home(user):
     state, rec = a.status(db, user["username"])
     st.write(f"Signed in as **{user['full_name']}**. " + {"in": "You are timed in.", "out": "You are not timed in.",
              "no_time_out": "An earlier time in was never closed."}[state])
-    module_cards("home", sections_for(user["role"]), on_click=go_to)
+    module_cards("home", user_sections(user)[0], on_click=go_to)
     c3, c4 = st.columns(2)
     with c3:
         notifications_card(user)
@@ -2150,20 +2225,18 @@ def main():
     elif st.session_state.get("token") and st.query_params.get("s") != st.session_state["token"]:
         st.query_params["s"] = st.session_state["token"]
     if not user:
-        if st.session_state.get("dest"):
+        with st.container(key="login_box"):
             login_page()
-        else:
-            landing_page()
         return
     if user.get("must_change"):
         password_form(user, forced=True)
         return
-    secs = sections_for(user["role"])
+    secs, mod_role = user_sections(user)
     asked = (st.session_state.get("nav") or (st.session_state.get("dest"),))[0]
     denied = asked if asked not in (None, "Home", *secs) else None
     if denied:
         st.session_state.pop("dest", None)
-        st.session_state.pop("nav", None)
+        st.session_state["nav"] = ("Home", "Home")
     # The open page is kept in the address too, so a refresh returns to the same page.
     section, page = st.session_state.get("nav") or (
         st.query_params.get("sec") or st.session_state.get("dest"), st.query_params.get("pg"))
@@ -2179,9 +2252,9 @@ def main():
     with st.container(key="menu_card"):
         menus = [m[0] for m in MODULES if m[0] in secs]
         nn = st.session_state.get("nav_n", 0)
-        cols = st.columns([2.2, 0.7] + [1.15] * len(menus) + [max(0.3, 6.0 - 1.15 * len(menus)), 1.8],
-                          vertical_alignment="center")
-        cols[0].markdown(f'<div class="brand"><span class="dot"></span>{PORTAL_NAME}</div>', unsafe_allow_html=True)
+        # The widths here only matter on very old browsers; the CSS lets each item take the room it needs.
+        cols = st.columns([1.6, 0.6] + [1] * len(menus) + [0.2, 1.4], vertical_alignment="center", gap="small")
+        cols[0].markdown(f'<div class="brand"><span class="dot"></span><span class="name">{PORTAL_NAME}</span></div>', unsafe_allow_html=True)
         with cols[1].container(key="navsec_Home"):
             st.button("Home", key="nav_home", type="tertiary", on_click=go_to, args=("Home", "Home"))
         for i, name in enumerate(menus):
@@ -2189,20 +2262,21 @@ def main():
                 with st.popover(name):
                     for p in secs[name]:
                         st.button(p, key=f"nav_{name}_{p}", type="tertiary", on_click=go_to, args=(name, p))
+        cols[-2].container(key="nav_spacer")
         with cols[-1].container(key=f"navsec_user_{nn}"):
             with st.popover(user["full_name"]):
                 st.caption(f"Role: {user['role']}")
                 for p in secs["Home"][1:]:
                     st.button(p, key=f"nav_Home_{p}", type="tertiary", on_click=go_to, args=("Home", p))
                 out = st.button("Sign out", key="nav_sign_out")
-    # the open section is underlined in the bar; the breadcrumb sits in its own strip below
+    # the open section is highlighted in its own colour; the breadcrumb sits in its own strip below
     trail = ["Home"] if section == "Home" and page == "Home" else (
         ["Home", page] if section == "Home" else ["Home", section, page])
+    col = CUR["colour"] if section != "Home" else "#5BB0F0"
     st.markdown(
         f'<style>div[class*="st-key-navsec_{section.replace(" ", "_")}"] button {{'
-        f'border-bottom: 3px solid {MOD_COLOUR.get(section, "#5BB0F0") if section != "Home" else "#5BB0F0"} !important; '
-        'border-radius: 0 !important; background: rgba(255,255,255,.10) !important;}</style>'
-        f'<style>.crumb {{border-left: 6px solid {CUR["colour"]};}}</style>'
+        f'background: {col}40 !important; box-shadow: inset 0 -3px 0 {col};}}'
+        f'.crumb {{border-left: 6px solid {CUR["colour"]};}}</style>'
         '<div class="crumb">' + '<i>/</i>'.join(
             f"<b>{t}</b>" if i == len(trail) - 1 else f"<span>{t}</span>" for i, t in enumerate(trail)) + "</div>",
         unsafe_allow_html=True)
@@ -2217,7 +2291,8 @@ def main():
             st.rerun()
     if denied:
         st.warning(f"Your account does not have {denied} access. Ask the owner if you need it.")
-    PAGE_FUNCS[page](user)
+    # Inside a module the person works with the level the owner gave them there (or their own role).
+    PAGE_FUNCS[page](dict(user, role=mod_role[section]) if section in mod_role else user)
     st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "
                "Do not share the page address while signed in.")
 

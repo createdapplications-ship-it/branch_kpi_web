@@ -3,12 +3,21 @@
 One app, one database, one account per person. Sections: Home, Attendance, Branch KPI, HR, Payroll and CRM.
 Each person sees only the sections their role allows.
 
-## Main page and menu
-- The main page shows a card for every module: Attendance, Branch KPI, HR, Payroll and CRM. No sign-in is needed to see it.
-- Any card leads to the sign-in page. After sign-in, the role decides access. A module the role cannot use shows "Your account does not have access".
-- The menu bar lists only the modules the person can open, in a smaller font.
+## Sign-in, Home and menu
+- The first page is the sign-in page. Nothing else shows before sign-in.
+- After sign-in, Home shows a card only for the modules the person can open. The menu bar shows the same modules.
+- The menu bar stays on one line. On a phone it scrolls sideways.
 - Each module has its own colour: Attendance teal, Branch KPI blue, HR purple, Payroll green, CRM brown. The colour shows on the card, the menu mark, the title band and the breadcrumb.
 - Colours and card text are in the MODULES list at the top of app.py.
+
+## Module access (owner)
+- Users page, section Module access. The table shows every active user and their access in each module.
+- For one user and one module, pick: Role default, No access, or a level (for example Attendance: Supervisor, or HR: HR staff).
+- A level gives the pages and rights of that role inside that module only. Example: an employee with Attendance set to Supervisor can approve requests for their branch, and nothing else changes.
+- Branch levels (Branch entry, Supervisor) need the user to have a branch.
+- An owner always has full access. You cannot change your own access.
+- Changes apply on the user's next click. No new sign-in is needed. Every change is in the activity log.
+- Reset access puts one user back to what their role gives.
 
 ## Roles
 
