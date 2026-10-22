@@ -11,6 +11,9 @@ import streamlit as st
 
 import kpi_logic as k
 import att_logic as a
+import hr_logic as h
+import payroll_logic as p
+import crm_logic as c
 
 st.set_page_config(page_title="Company Portal", layout="wide", initial_sidebar_state="collapsed")
 
@@ -84,7 +87,14 @@ def get_db():
     db = k.connect(cfg("DATABASE_URL", ""))
     has_owner = k.init_db(db, cfg("ADMIN_USERNAME"), cfg("ADMIN_PASSWORD"),
                           load_sample=str(cfg("LOAD_SAMPLE_DATA", "true")).lower() in ("1", "true", "yes"))
+    h.init_hr(db)
+    p.init_payroll(db)
+    c.init_crm(db)
     return db, has_owner
+
+
+# The key that encrypts salary and pay data. Kept in the app secrets, never in the code.
+os.environ["SALARY_KEY"] = cfg("SALARY_KEY", "") or ""
 
 
 db, HAS_OWNER = get_db()
@@ -109,26 +119,38 @@ def refresh_data():
 
 
 KPI_PAGES = {
-    "employee": [],
+    "employee": [], "hr": [], "payroll": [],
     "branch": ["Daily Entry", "My Branch", "My Cluster"],
+    "supervisor": ["Daily Entry", "My Branch", "My Cluster"],
     "manager": ["Main Dashboard", "Quarter Ranking", "KPI Dashboard", "Drill-down"],
     "owner": ["Main Dashboard", "Quarter Ranking", "KPI Dashboard", "Drill-down", "Submission Check",
               "Data Quality", "Daily Entry", "Admin"],
 }
 ATT_PAGES = {
-    "employee": ["My Attendance"],
-    "branch": ["My Attendance"],
-    "manager": ["My Attendance", "Attendance Today", "Attendance Report"],
-    "owner": ["My Attendance", "Attendance Today", "Attendance Report", "Corrections"],
+    "employee": ["My Attendance", "My Requests"],
+    "branch": ["My Attendance", "My Requests"],
+    "supervisor": ["My Attendance", "My Requests", "Approvals", "Attendance Today", "Attendance Report"],
+    "hr": ["My Attendance", "My Requests", "Approvals", "Attendance Today", "Attendance Report", "Corrections"],
+    "payroll": ["My Attendance", "My Requests", "Attendance Report"],
+    "manager": ["My Attendance", "My Requests", "Approvals", "Attendance Today", "Attendance Report"],
+    "owner": ["My Attendance", "My Requests", "Approvals", "Attendance Today", "Attendance Report", "Corrections"],
 }
+HR_PAGES = {"hr": ["Employees", "Schedules", "Leave and Holidays"], "owner": ["Employees", "Schedules", "Leave and Holidays"]}
+PAY_PAGES = {"payroll": ["Pay Runs", "Rates and Allowances", "Targets and Bonus Rules", "13th Month", "Pay Settings"],
+             "owner": ["Pay Runs", "Rates and Allowances", "Targets and Bonus Rules", "13th Month", "Pay Settings"]}
+CRM_PAGES = {"employee": ["My Clients", "Call List"], "branch": ["My Clients", "Call List"],
+             "supervisor": ["My Clients", "Call List", "All Clients", "Assign Clients", "CRM Report"],
+             "manager": ["Call List", "All Clients", "Assign Clients", "CRM Report"],
+             "owner": ["My Clients", "Call List", "All Clients", "Assign Clients", "CRM Report"]}
 
 
 def sections_for(role):
     """The sections a role can open, and the pages in each."""
-    out = {"Home": ["Home", "My Account"] + (["Users"] if role == "owner" else []),
+    out = {"Home": ["Home", "My Payslips", "My Account"] + (["Users"] if role == "owner" else []),
            "Attendance": ATT_PAGES[role]}
-    if KPI_PAGES[role]:
-        out["Branch KPI"] = KPI_PAGES[role]
+    for name, pages in (("Branch KPI", KPI_PAGES), ("HR", HR_PAGES), ("Payroll", PAY_PAGES), ("CRM", CRM_PAGES)):
+        if pages.get(role):
+            out[name] = pages[role]
     return out
 
 
@@ -733,7 +755,7 @@ def page_users(user):
         c1, c2 = st.columns(2)
         username = c1.text_input("Username (for example branch01 or a name)")
         full_name = c2.text_input("Full name")
-        role = c1.selectbox("Role (employee = Attendance only, branch = can enter KPI data)", list(k.ROLES))
+        role = c1.selectbox("Role", list(k.ROLES))
         code = c2.selectbox("Branch (needed for the branch role, optional for others)",
                             ["(none)"] + list(branches["branch_code"]))
         add = st.form_submit_button("Create user")
@@ -748,8 +770,10 @@ def page_users(user):
             st.error(str(err))
 
     st.subheader("Change a user's role or branch")
-    st.caption("employee: Attendance only. branch: Attendance, plus Daily Entry, My Branch and My Cluster for its "
-               "own branch. manager: dashboards for all branches. owner: everything.")
+    st.caption("employee: Attendance, requests, payslips and own CRM clients. branch: also Daily Entry, My Branch "
+               "and My Cluster. supervisor: a branch user who also approves requests and sees the branch's attendance "
+               "and CRM. hr: employees, schedules, leave and approvals, no salary. payroll: pay runs and rates. "
+               "manager: dashboards and reports for all branches. owner: everything.")
     with st.form("change_role"):
         r1, r2, r3 = st.columns(3)
         who = r1.selectbox("User to change", list(users["username"]))
@@ -912,6 +936,33 @@ def page_admin(user):
         st.success(f"{removed:,} sample entries removed.")
     st.subheader("Recent activity")
     xl_table(k.recent_log(db).rename(columns={"at": "When", "username": "User", "action": "Action", "detail": "Detail"}))
+    portal_settings(user)
+
+
+def portal_settings(user):
+    """Owner settings for HR and payroll data, shown at the end of the Admin page."""
+    st.subheader("HR and payroll data")
+    if h.encryption_on():
+        st.success("Salary and pay data are encrypted with the SALARY_KEY secret.")
+    else:
+        st.warning("SALARY_KEY is not set in the app secrets. Add it before loading real salaries, then reboot the app. "
+                   "Keep a copy of the key somewhere safe: without it, encrypted pay data cannot be read.")
+    bank = h.store_bank_details(db)
+    with st.form("set_bank"):
+        on = st.checkbox("Store bank details in the portal", value=bank, key="set_bank_on")
+        grace = st.number_input("Grace minutes before a time in counts as late", min_value=0, max_value=60,
+                                value=int(h.get_setting(db, "grace_minutes", "0")), key="set_grace")
+        go = st.form_submit_button("Save settings")
+    if go:
+        h.set_setting(db, "store_bank_details", "1" if on else "0", user["username"])
+        h.set_setting(db, "grace_minutes", int(grace), user["username"])
+        st.success("Settings saved.")
+    st.caption("Leave bank details off to keep account numbers out of the portal. Payroll then uses the payout list "
+               "(employee ID, name, net pay) in the bank's own payroll service.")
+    if bank and st.button("Turn off and delete all stored bank details", key="clear_bank"):
+        n = h.clear_bank_details(db, user["username"])
+        h.set_setting(db, "store_bank_details", "0", user["username"])
+        st.success(f"Bank details removed from {n} records.")
 
 
 def page_my_account(user):
@@ -941,6 +992,14 @@ def page_home(user):
             st.button("Open Branch KPI", key="home_kpi", type="primary", on_click=go_to, args=("Branch KPI",))
         else:
             st.write("Your account does not have Branch KPI access. Ask the owner if you need it.")
+    c3, c4 = st.columns(2)
+    with c3:
+        notifications_card(user)
+    with c4, card("home_pay"):
+        st.subheader("Payslips")
+        ps = p.my_payslips(db, user["username"])
+        st.write(f"Latest: {ps.iloc[0]['start_date']} to {ps.iloc[0]['end_date']}." if len(ps) else "No payslips yet.")
+        st.button("Open My Payslips", key="home_payslip", type="primary", on_click=go_to, args=("Home", "My Payslips"))
 
 
 def _hm(v):
@@ -1000,7 +1059,7 @@ def page_attendance_today(user):
     branches = branch_list()
     c1, c2 = st.columns(2)
     day = c1.date_input("Date", value=a.local_today(), max_value=a.local_today())
-    pick = c2.selectbox("Branch", ["All branches"] + list(branches["branch_code"]))
+    pick = scope_branch(user) or c2.selectbox("Branch", ["All branches"] + list(branches["branch_code"]))
     b = a.today_board(db, day)
     if pick != "All branches":
         b = b[b["branch_code"] == pick]
@@ -1014,33 +1073,6 @@ def page_attendance_today(user):
                       "Hours": b["hours"]})
     xl_table(t, {"Hours": "{:.2f}"})
     st.caption(f"Times are shown in {a.TZ_NAME} time.")
-
-
-def page_attendance_report(user):
-    st.title("Attendance Report")
-    today = a.local_today()
-    c1, c2 = st.columns(2)
-    start = c1.date_input("From", value=today.replace(day=1))
-    end = c2.date_input("To", value=today)
-    if start > end:
-        st.error("From must be on or before To.")
-        return
-    r = a.report(db, start, end)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("People with attendance", f"{int((r['days_present'] > 0).sum())} of {len(r)}")
-    m2.metric("Total hours", f"{r['hours'].sum():,.1f}")
-    m3.metric("Records with no time out", f"{int(r['no_time_out'].sum())}")
-    fmt_table(r, {"full_name": "Name", "branch_code": "Branch", "role": "Role", "days_present": "Days Present",
-                  "hours": "Hours", "avg_hours": "Avg Hours per Day", "no_time_out": "No Time Out"},
-              {"Hours": "{:,.2f}", "Avg Hours per Day": "{:.2f}"})
-    st.download_button("Download the summary as CSV", r.to_csv(index=False), "attendance_summary.csv", "text/csv")
-    detail = a.records(db, start, end)
-    if len(detail):
-        st.subheader("All records")
-        att_table(detail)
-        out = detail[["work_date", "username", "full_name", "branch_code", "in_local", "out_local", "hours",
-                      "status", "note", "edited_by"]]
-        st.download_button("Download all records as CSV", out.to_csv(index=False), "attendance_records.csv", "text/csv")
 
 
 def _parse_time(text, label, required=True):
@@ -1103,6 +1135,963 @@ def page_corrections(user):
             st.error(str(err))
 
 
+# ---------------------------------------------------------------- shared helpers for the HR, payroll and CRM pages
+def people(role_filter=None, branch=None, active=True):
+    """Usernames and names for pickers."""
+    u = k.list_users(db)
+    if active:
+        u = u[u["active"].astype(int) == 1]
+    if role_filter:
+        u = u[u["role"].isin(role_filter)]
+    if branch:
+        u = u[u["branch_code"] == branch]
+    return u.reset_index(drop=True)
+
+
+def person_label(users):
+    names = users.set_index("username")["full_name"].to_dict()
+    return lambda x: f"{names.get(x, x)} ({x})" if x else "(none)"
+
+
+def scope_branch(user):
+    """Supervisors and branch users see their own branch only. None = all branches."""
+    return user["branch_code"] if user["role"] in ("supervisor", "branch", "employee") else None
+
+
+def read_upload(up):
+    if up is None:
+        return None
+    if up.name.lower().endswith(".xlsx"):
+        return pd.read_excel(up, dtype=str)
+    return pd.read_csv(up, dtype=str)
+
+
+def show_problems(problems, what="row(s)"):
+    if problems is not None and len(problems):
+        st.warning(f"{len(problems)} {what} were skipped:")
+        xl_table(problems)
+
+
+def peso(v):
+    return "" if v is None or pd.isna(v) else f"₱{v:,.2f}"
+
+
+# ---------------------------------------------------------------- Home additions
+def page_my_payslips(user):
+    st.title("My Payslips")
+    ps = p.my_payslips(db, user["username"])
+    if ps.empty:
+        st.info("No payslips yet. A payslip shows here once payroll finalizes a pay period.")
+        return
+    labels = {r["id"]: f"{r['start_date']} to {r['end_date']}" + (f" (paid {r['pay_date']})" if r["pay_date"] else "")
+              for _, r in ps.iterrows()}
+    pid = st.selectbox("Pay period", list(labels), format_func=lambda x: labels[x])
+    line = p.final_lines(db, pid, user["username"])
+    if line.empty:
+        st.info("No payslip for this period.")
+        return
+    L = line.iloc[0]
+    title_band("Payslip", labels[pid])
+    tiles([("Gross pay", peso(L["gross"]), "Before deductions", BLUE),
+           ("Deductions", peso(L["contributions"] + L["tax"]), "Contributions and tax", AMBER),
+           ("Net pay", peso(L["net"]), "Take-home", GREEN)])
+    earn = [("Basic pay", L["basic"]), ("Overtime", L["overtime_pay"]), ("Night differential", L["night_diff_pay"]),
+            ("Rest day work", L["rest_day_pay"]), ("Holiday work", L["holiday_pay"])]
+    earn += [(x["label"], x["amount"]) for x in (L["allowance_lines"] or [])]
+    earn += [(x["label"], x["amount"]) for x in (L["bonus_lines"] or [])]
+    earn += [(x["label"], x["amount"]) for x in (L["adjustment_lines"] or [])]
+    ded = [("SSS", L["sss"]), ("PhilHealth", L["philhealth"]), ("Pag-IBIG", L["pagibig"]), ("Withholding tax", L["tax"])]
+    c1, c2 = st.columns(2)
+    with c1:
+        section_band("Earnings")
+        xl_table(pd.DataFrame([e for e in earn if e[1]], columns=["Item", "Amount"]), {"Amount": "₱{:,.2f}"})
+    with c2:
+        section_band("Deductions")
+        xl_table(pd.DataFrame(ded, columns=["Item", "Amount"]), {"Amount": "₱{:,.2f}"})
+    st.caption(f"Absences: {L['absences']} · Late and undertime: {L['late_undertime_min']:.0f} minutes · "
+               f"Deducted for absences {peso(L['absence_deduction'])} and lateness {peso(L['late_deduction'])}.")
+
+
+def notifications_card(user):
+    c.due_reminders(db, user["username"])
+    notes = c.my_notifications(db, user["username"])
+    with card("home_notes"):
+        st.subheader("Notifications")
+        if notes.empty:
+            st.write("Nothing new.")
+            return
+        for _, n in notes.iterrows():
+            st.write(f"{n['message']}  \n{str(n['at'])[:16].replace('T', ' ')}")
+        if st.button("Mark all as read", key="notes_read"):
+            c.mark_read(db, user["username"])
+            st.rerun()
+
+
+# ---------------------------------------------------------------- Attendance: requests and approvals
+def page_my_requests(user):
+    st.title("My Requests")
+    me = user["username"]
+    today = a.local_today()
+    t1, t2 = st.tabs(["Attendance correction or overtime", "Leave"])
+    with t1:
+        with st.form("att_req"):
+            c1, c2 = st.columns(2)
+            wd = c1.date_input("Date", value=today, max_value=today, key="req_date")
+            kind = c2.selectbox("Request", list(h.REQUEST_KINDS))
+            c3, c4, c5 = st.columns(3)
+            ri = c3.text_input("Correct time in (HH:MM)", key="req_in")
+            ro = c4.text_input("Correct time out (HH:MM)", key="req_out")
+            ot = c5.number_input("Overtime hours", min_value=0.0, max_value=12.0, step=0.5, key="req_ot")
+            why = st.text_input("Reason", key="req_reason")
+            go = st.form_submit_button("Send request")
+        if go:
+            try:
+                h.request_attendance(db, me, wd, kind, why, ri or None, ro or None, ot or None)
+                st.success("Request sent to your supervisor.")
+            except ValueError as err:
+                st.error(str(err))
+        r = h.list_att_requests(db, username=me)
+        section_band("My attendance requests")
+        if r.empty:
+            st.write("No requests yet.")
+        else:
+            fmt_table(r, {"work_date": "Date", "kind": "Request", "req_in": "Time In", "req_out": "Time Out",
+                          "ot_hours": "OT Hours", "reason": "Reason", "status": "Status", "reviewed_by": "Reviewed By",
+                          "review_note": "Note"}, {"OT Hours": "{:.1f}"}, status="Status")
+            pend = r[r["status"] == "Pending"]
+            if len(pend):
+                with st.form("att_cancel"):
+                    rid = st.selectbox("Cancel a pending request", list(pend["id"]),
+                                       format_func=lambda x: f"{pend.set_index('id').loc[x, 'work_date']} {pend.set_index('id').loc[x, 'kind']}")
+                    cancel = st.form_submit_button("Cancel request")
+                if cancel:
+                    try:
+                        h.cancel_request(db, "att_requests", rid, me)
+                        st.success("Request cancelled.")
+                    except ValueError as err:
+                        st.error(str(err))
+    with t2:
+        bal = h.leave_balances(db, me, today.year)
+        section_band(f"My leave balance, {today.year}")
+        fmt_table(bal, {"name": "Leave", "entitled": "Entitled", "used": "Used", "remaining": "Remaining"},
+                  {"Entitled": "{:g}", "Used": "{:g}", "Remaining": "{:g}"})
+        types = h.leave_types(db)
+        with st.form("leave_req"):
+            c1, c2, c3 = st.columns(3)
+            code = c1.selectbox("Leave type", list(types["code"]), format_func=lambda x: types.set_index("code").loc[x, "name"])
+            d0 = c2.date_input("From", value=today, key="lv_from")
+            d1 = c3.date_input("To", value=today, key="lv_to")
+            half = st.checkbox("Half day (one date only)", key="lv_half")
+            why = st.text_input("Reason (optional)", key="lv_reason")
+            go = st.form_submit_button("Request leave")
+        if go:
+            try:
+                h.request_leave(db, me, code, d0, d1, why, half)
+                st.success("Leave request sent.")
+            except ValueError as err:
+                st.error(str(err))
+        r = h.list_leave_requests(db, username=me)
+        if len(r):
+            section_band("My leave requests")
+            fmt_table(r, {"leave_name": "Leave", "start_date": "From", "end_date": "To", "days": "Days",
+                          "status": "Status", "reviewed_by": "Reviewed By", "review_note": "Note"},
+                      {"Days": "{:g}"}, status="Status")
+            pend = r[r["status"] == "Pending"]
+            if len(pend):
+                with st.form("lv_cancel"):
+                    rid = st.selectbox("Cancel a pending leave request", list(pend["id"]),
+                                       format_func=lambda x: f"{pend.set_index('id').loc[x, 'leave_name']} {pend.set_index('id').loc[x, 'start_date']}")
+                    cancel = st.form_submit_button("Cancel leave request")
+                if cancel:
+                    try:
+                        h.cancel_request(db, "leave_requests", rid, me)
+                        st.success("Leave request cancelled.")
+                    except ValueError as err:
+                        st.error(str(err))
+
+
+def page_approvals(user):
+    st.title("Approvals")
+    ar = h.list_att_requests(db, status="Pending", approver=user)
+    lr = h.list_leave_requests(db, status="Pending", approver=user)
+    tiles([("Attendance requests", len(ar), "Waiting for you", AMBER if len(ar) else GREEN),
+           ("Leave requests", len(lr), "Waiting for you", AMBER if len(lr) else GREEN)])
+    section_band("Attendance corrections and overtime")
+    if ar.empty:
+        st.write("Nothing to approve.")
+    else:
+        fmt_table(ar, {"full_name": "Name", "branch_code": "Branch", "work_date": "Date", "kind": "Request",
+                       "req_in": "Time In", "req_out": "Time Out", "ot_hours": "OT Hours", "reason": "Reason"},
+                  {"OT Hours": "{:.1f}"})
+        lab = {r["id"]: f"{r['full_name']}, {r['work_date']}, {r['kind']}" for _, r in ar.iterrows()}
+        with st.form("ap_att"):
+            rid = st.selectbox("Request", list(lab), format_func=lambda x: lab[x])
+            dec = st.radio("Decision", ["Approve", "Reject"], key="ap_att_dec")
+            note = st.text_input("Note to the employee (optional)", key="ap_att_note")
+            go = st.form_submit_button("Save decision")
+        if go:
+            try:
+                h.review_att_request(db, rid, dec == "Approve", user, note)
+                st.success(f"Request {dec.lower()}d.")
+            except ValueError as err:
+                st.error(str(err))
+    section_band("Leave")
+    if lr.empty:
+        st.write("Nothing to approve.")
+    else:
+        fmt_table(lr, {"full_name": "Name", "branch_code": "Branch", "leave_name": "Leave", "start_date": "From",
+                       "end_date": "To", "days": "Days", "reason": "Reason"}, {"Days": "{:g}"})
+        lab = {r["id"]: f"{r['full_name']}, {r['leave_name']}, {r['start_date']}" for _, r in lr.iterrows()}
+        with st.form("ap_lv"):
+            rid = st.selectbox("Leave request", list(lab), format_func=lambda x: lab[x])
+            dec = st.radio("Decision", ["Approve", "Reject"], key="ap_lv_dec")
+            note = st.text_input("Note to the employee (optional)", key="ap_lv_note")
+            go = st.form_submit_button("Save leave decision")
+        if go:
+            try:
+                h.review_leave(db, rid, dec == "Approve", user, note)
+                st.success(f"Leave {dec.lower()}d.")
+            except ValueError as err:
+                st.error(str(err))
+
+
+def page_attendance_report(user):
+    today = a.local_today()
+    branches = branch_list()
+    c1, c2, c3 = st.columns(3)
+    start = c1.date_input("From", value=today.replace(day=1), key="ar_from")
+    end = c2.date_input("To", value=today, key="ar_to")
+    own = scope_branch(user)
+    pick = own or c3.selectbox("Branch", ["All branches"] + list(branches["branch_code"]), key="ar_branch")
+    if start > end:
+        st.error("From must be on or before To.")
+        return
+    users = people(branch=None if pick == "All branches" else pick)
+    names = list(users["username"])
+    title_band("Attendance Report", f"{start:%d %b %Y} to {end:%d %b %Y} &nbsp;|&nbsp; {pick}")
+    sm = h.attendance_summary(db, start, end, names)
+    ds = h.daily_status(db, start, end, names)
+    tiles([("People", len(sm), "In this report", BLUE),
+           ("Absences", int(sm["absences"].sum()), "Scheduled days not worked", RED if sm["absences"].sum() else GREEN),
+           ("Late", int(sm["late_count"].sum()), f"{sm['late_min'].sum():,.0f} minutes in total", AMBER if sm["late_count"].sum() else GREEN),
+           ("Leave days", f"{sm['leave_days'].sum():g}", "Approved", BLUE),
+           ("Overtime", f"{sm['ot_hours'].sum():,.1f} h", "Approved", BLUE)])
+    if len(ds):
+        counts = ds.groupby("status", as_index=False).size().rename(columns={"size": "days"})
+        g1, g2 = st.columns([2, 3])
+        with g1, panel("ar_status", "Days by Status"):
+            donut(counts, "status", "days", "Status", "Days", ["#2E8B57", "#D9822B", "#C0392B", "#0F6CBD", "#7A5AA6", "#9AA5B1", "#3AA6B9"])
+        with g2, panel("ar_late", "Late Minutes by Person"):
+            late = sm[sm["late_min"] > 0]
+            if len(late):
+                hbar(late[["full_name", "late_min"]], "full_name", "late_min", "Name", "Late minutes")
+            else:
+                st.write("No late arrivals in this period.")
+    section_band("Summary by person")
+    fmt_table(sm, {"full_name": "Name", "branch_code": "Branch", "days_present": "Days Present", "absences": "Absences",
+                   "late_count": "Times Late", "late_min": "Late Min", "undertime_min": "Undertime Min",
+                   "leave_days": "Leave Days", "ot_hours": "OT Hours", "night_hours": "Night Hours",
+                   "worked_hours": "Hours Worked", "no_time_out": "No Time Out"},
+              {"Late Min": "{:,.0f}", "Undertime Min": "{:,.0f}", "Leave Days": "{:g}", "OT Hours": "{:.1f}",
+               "Night Hours": "{:.1f}", "Hours Worked": "{:,.1f}"})
+    st.download_button("Download the summary as CSV", sm.to_csv(index=False), "attendance_summary.csv", "text/csv")
+    if len(ds):
+        section_band("Day by day")
+        t = ds.merge(users[["username", "full_name"]], on="username", how="left")
+        t["first_in"] = [_hm(v) for v in t["first_in"]]
+        t["last_out"] = [_hm(v) for v in t["last_out"]]
+        fmt_table(t, {"work_date": "Date", "full_name": "Name", "shift_start": "Shift Start", "shift_end": "Shift End",
+                      "first_in": "Time In", "last_out": "Time Out", "late_min": "Late Min", "undertime_min": "Undertime Min",
+                      "ot_hours": "OT Hours", "status": "Status"},
+                  {"Late Min": "{:,.0f}", "Undertime Min": "{:,.0f}", "OT Hours": "{:.1f}"}, status="Status")
+        st.download_button("Download day by day as CSV", t.to_csv(index=False), "attendance_daily.csv", "text/csv")
+
+
+# ---------------------------------------------------------------- HR
+EMP_TEMPLATE = "Employee ID,Full Name,Username,Branch,Position,Employment Status,Civil Status,Date Hired\n,Juan Cruz,juan.cruz,Branch01,Encoder,Regular,Married,2024-03-01\n"
+SCHED_DATE_TEMPLATE = "Employee,Date,Start,End,Break Minutes,Rest Day\n2026-0001,2026-11-02,08:00,17:00,60,No\n2026-0001,2026-11-07,,,,Yes\n"
+SCHED_WEEK_TEMPLATE = "Employee,Day,Start,End,Break Minutes,Rest Day,From,To\n2026-0001,Mon,08:00,17:00,60,No,2026-11-01,2026-11-30\n2026-0001,Sun,,,,Yes,2026-11-01,2026-11-30\n"
+
+
+def page_employees(user):
+    st.title("Employees")
+    branches = branch_list()
+    emps = h.list_employees(db)
+    tiles([("Active employees", int((emps["active"] == 1).sum()), "On record", BLUE),
+           ("Linked to an account", int(emps["username"].notna().sum()), "Can use Attendance", BLUE),
+           ("Not linked", int(emps["username"].isna().sum()), "Need an account for attendance and payroll",
+            AMBER if emps["username"].isna().sum() else GREEN)])
+    section_band("Employee list")
+    fmt_table(emps.assign(active=emps["active"].map({1: "Yes", 0: "No"})),
+              {"emp_id": "Employee ID", "full_name": "Name", "username": "Username", "branch_code": "Branch",
+               "position": "Position", "employment_status": "Status", "civil_status": "Civil Status",
+               "date_hired": "Date Hired", "rate_type": "Rate Type", "active": "Active"})
+    st.caption("Salary is not shown here. Payroll sets rates on the Rates and Allowances page.")
+    users = people()
+    st.subheader("Add or edit an employee")
+    choice = st.selectbox("Employee", ["(new employee)"] + list(emps["emp_id"]), key="emp_pick",
+                          format_func=lambda x: x if x == "(new employee)" else f"{x} {emps.set_index('emp_id').loc[x, 'full_name']}")
+    cur = emps.set_index("emp_id").loc[choice] if choice != "(new employee)" else None
+    def val(col, default=""):
+        return default if cur is None or cur[col] is None or (not isinstance(cur[col], str) and pd.isna(cur[col])) else cur[col]
+    with st.form("emp_form"):
+        c1, c2, c3 = st.columns(3)
+        eid = c1.text_input("Employee ID (blank = next number)", value="" if cur is None else choice, key="emp_id")
+        name = c2.text_input("Full name", value=val("full_name"), key="emp_name")
+        uopts = ["(none)"] + list(users["username"])
+        uname = c3.selectbox("Portal account", uopts, index=uopts.index(val("username")) if val("username") in uopts else 0,
+                             format_func=person_label(users), key="emp_user")
+        c4, c5, c6 = st.columns(3)
+        bopts = ["(none)"] + list(branches["branch_code"])
+        br = c4.selectbox("Branch", bopts, index=bopts.index(val("branch_code")) if val("branch_code") in bopts else 0, key="emp_branch")
+        pos = c5.text_input("Position", value=val("position"), key="emp_pos")
+        hired = c6.text_input("Date hired (YYYY-MM-DD)", value=val("date_hired"), key="emp_hired")
+        c7, c8 = st.columns(2)
+        es = c7.selectbox("Employment status", list(h.EMPLOYMENT_STATUSES),
+                          index=list(h.EMPLOYMENT_STATUSES).index(val("employment_status", "Probationary")), key="emp_es")
+        cs = c8.selectbox("Civil status", list(h.CIVIL_STATUSES), index=list(h.CIVIL_STATUSES).index(val("civil_status", "Single")), key="emp_cs")
+        save = st.form_submit_button("Save employee")
+    if save:
+        try:
+            saved = h.save_employee(db, user["username"], emp_id=eid or None, full_name=name,
+                                    username=None if uname == "(none)" else uname, branch_code=None if br == "(none)" else br,
+                                    position=pos or None, employment_status=es, civil_status=cs, date_hired=hired or None,
+                                    rate_type=val("rate_type", "monthly"))
+            st.success(f"Employee {saved} saved.")
+        except ValueError as err:
+            st.error(str(err))
+    st.caption("Civil status is kept for records and BIR forms. Under the TRAIN law it does not change the tax rate.")
+    st.subheader("Add many employees from a file")
+    st.download_button("Download the employee template", EMP_TEMPLATE, "employee_template.csv", "text/csv")
+    up = st.file_uploader("Employee list (.csv or .xlsx)", type=["csv", "xlsx"], key="emp_up")
+    if up is not None and st.button("Load employees", key="emp_load"):
+        try:
+            done, probs = h.bulk_employees(db, read_upload(up), user["username"])
+            st.success(f"{len(done)} employee(s) saved.")
+            show_problems(probs)
+        except ValueError as err:
+            st.error(str(err))
+    if len(emps):
+        with st.form("emp_active"):
+            target = st.selectbox("Employee to activate or deactivate", list(emps["emp_id"]), key="emp_act_pick")
+            act = st.radio("Set to", ["Inactive", "Active"], key="emp_act")
+            go = st.form_submit_button("Apply")
+        if go:
+            h.set_employee_active(db, target, act == "Active", user["username"])
+            st.success(f"{target} is now {act.lower()}.")
+
+
+def page_schedules(user):
+    st.title("Schedules")
+    st.write("Upload one row per employee per day, or a weekly pattern with a From and To date. "
+             "Employee can be the employee ID or the username. A new row for the same person and day replaces the old one.")
+    c1, c2 = st.columns(2)
+    c1.download_button("Template: one row per day", SCHED_DATE_TEMPLATE, "schedule_by_date.csv", "text/csv")
+    c2.download_button("Template: weekly pattern", SCHED_WEEK_TEMPLATE, "schedule_weekly.csv", "text/csv")
+    up = st.file_uploader("Schedule file (.csv or .xlsx)", type=["csv", "xlsx"], key="sch_up")
+    if up is not None and st.button("Check and load schedule", key="sch_load"):
+        try:
+            rows, probs = h.read_schedule_table(db, read_upload(up))
+            n = h.import_schedules(db, rows, user["username"]) if rows else 0
+            st.success(f"{n} schedule day(s) saved.")
+            show_problems(probs)
+        except ValueError as err:
+            st.error(str(err))
+    users = people()
+    st.subheader("Change one day")
+    with st.form("sch_one"):
+        c1, c2, c3, c4 = st.columns(4)
+        who = c1.selectbox("Person", list(users["username"]), format_func=person_label(users), key="sch_who")
+        day = c2.date_input("Date", value=a.local_today(), key="sch_day")
+        s0 = c3.text_input("Start (HH:MM)", value="08:00", key="sch_s")
+        s1 = c4.text_input("End (HH:MM)", value="17:00", key="sch_e")
+        c5, c6 = st.columns(2)
+        brk = c5.number_input("Break minutes", min_value=0, max_value=180, value=60, step=15, key="sch_brk")
+        rest = c6.checkbox("Rest day", key="sch_rest")
+        go = st.form_submit_button("Save day")
+    if go:
+        try:
+            h.set_schedule(db, who, day, s0, s1, brk, rest, user["username"])
+            st.success("Schedule saved.")
+        except ValueError as err:
+            st.error(str(err))
+    today = a.local_today()
+    c1, c2 = st.columns(2)
+    v0 = c1.date_input("Show from", value=today, key="sch_v0")
+    v1 = c2.date_input("Show to", value=today + pd.Timedelta(days=13), key="sch_v1")
+    sc = h.get_schedules(db, v0, v1)
+    section_band("Schedules")
+    if sc.empty:
+        st.write("No schedules in these dates.")
+    else:
+        sc = sc.merge(users[["username", "full_name", "branch_code"]], on="username", how="left")
+        sc["rest_day"] = sc["rest_day"].map({1: "Yes", 0: ""})
+        fmt_table(sc, {"work_date": "Date", "full_name": "Name", "branch_code": "Branch", "shift_start": "Start",
+                       "shift_end": "End", "break_minutes": "Break Min", "rest_day": "Rest Day"})
+
+
+def page_leave_setup(user):
+    st.title("Leave and Holidays")
+    t1, t2, t3 = st.tabs(["Leave types", "Balances", "Holidays"])
+    with t1:
+        lt = h.leave_types(db, active_only=False)
+        fmt_table(lt.assign(paid=lt["paid"].map({1: "Yes", 0: "No"})),
+                  {"code": "Code", "name": "Leave", "paid": "Paid", "days_per_year": "Days per Year"}, {"Days per Year": "{:g}"})
+        st.caption("Service Incentive Leave (5 paid days after one year of service) is the leave the Labor Code requires. "
+                   "Other leave days follow company policy and the special leave laws. HR should confirm the list.")
+        with st.form("lt_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            code = c1.text_input("Code", key="lt_code")
+            name = c2.text_input("Name", key="lt_name")
+            days = c3.number_input("Days per year", min_value=0.0, step=1.0, key="lt_days")
+            paid = c4.checkbox("Paid", value=True, key="lt_paid")
+            go = st.form_submit_button("Save leave type")
+        if go:
+            try:
+                h.save_leave_type(db, code, name, paid, days, user["username"])
+                st.success("Leave type saved.")
+            except ValueError as err:
+                st.error(str(err))
+    with t2:
+        users = people()
+        types = h.leave_types(db)
+        with st.form("bal_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            who = c1.selectbox("Person", list(users["username"]), format_func=person_label(users), key="bal_who")
+            yr = c2.number_input("Year", min_value=2020, max_value=2100, value=a.local_today().year, key="bal_year")
+            code = c3.selectbox("Leave type", list(types["code"]), key="bal_code")
+            ent = c4.number_input("Entitled days", min_value=0.0, step=0.5, key="bal_ent")
+            go = st.form_submit_button("Set balance")
+        if go:
+            try:
+                h.set_leave_balance(db, who, int(yr), code, ent, user["username"])
+                st.success("Balance saved.")
+            except ValueError as err:
+                st.error(str(err))
+        if len(users):
+            pick = st.selectbox("Show balances for", list(users["username"]), format_func=person_label(users), key="bal_show")
+            fmt_table(h.leave_balances(db, pick, a.local_today().year),
+                      {"name": "Leave", "entitled": "Entitled", "used": "Used", "remaining": "Remaining"},
+                      {"Entitled": "{:g}", "Used": "{:g}", "Remaining": "{:g}"})
+    with t3:
+        hol = h.get_holidays(db)
+        if len(hol):
+            fmt_table(hol, {"hdate": "Date", "name": "Holiday", "kind": "Kind"})
+        else:
+            st.write("No holidays yet. Add this year's regular holidays and special non-working days.")
+        with st.form("hol_form"):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("Date", value=a.local_today(), key="hol_d")
+            name = c2.text_input("Name", key="hol_n")
+            kind = c3.selectbox("Kind", ["regular", "special"], key="hol_k")
+            add = st.form_submit_button("Save holiday")
+        if add:
+            try:
+                h.set_holiday(db, d, name, kind, user["username"])
+                st.success("Holiday saved.")
+            except ValueError as err:
+                st.error(str(err))
+        if len(hol):
+            with st.form("hol_rm"):
+                d = st.selectbox("Remove a holiday", list(hol["hdate"]), key="hol_rm_d")
+                rm = st.form_submit_button("Remove")
+            if rm:
+                h.remove_holiday(db, d, user["username"])
+                st.success("Holiday removed.")
+
+
+# ---------------------------------------------------------------- Payroll
+def page_pay_runs(user):
+    st.title("Pay Runs")
+    with st.form("pp_new"):
+        c1, c2, c3, c4 = st.columns(4)
+        d0 = c1.date_input("Period start", value=a.local_today().replace(day=1), key="pp_d0")
+        d1 = c2.date_input("Period end", value=a.local_today().replace(day=15), key="pp_d1")
+        pay = c3.date_input("Pay date", value=a.local_today().replace(day=15), key="pp_pay")
+        freq = c4.selectbox("Frequency", ["semi-monthly", "monthly"], key="pp_freq")
+        c5, c6 = st.columns(2)
+        part = c5.selectbox("Part of the month (semi-monthly)", [1, 2], key="pp_part")
+        bm = c6.text_input("Include bonuses for month (YYYY-MM, optional)", key="pp_bm")
+        go = st.form_submit_button("Create pay period")
+    if go:
+        try:
+            p.create_period(db, d0, d1, freq, pay, part, bm or None, user["username"])
+            st.success("Pay period created as a draft.")
+        except ValueError as err:
+            st.error(str(err))
+    pers = p.periods(db)
+    if pers.empty:
+        st.info("No pay periods yet.")
+        return
+    lab = {r["id"]: f"{r['start_date']} to {r['end_date']} ({r['status']})" for _, r in pers.iterrows()}
+    pid = st.selectbox("Pay period", list(lab), format_func=lambda x: lab[x], key="pp_pick")
+    per = p.get_period(db, pid)
+    lines, probs = p.compute_period(db, pid)
+    title_band("Pay Run", f"{per['start_date']} to {per['end_date']} &nbsp;|&nbsp; {per['frequency']} &nbsp;|&nbsp; {per['status']}")
+    if lines.empty:
+        st.info("No employees with an account and a rate yet.")
+        show_problems(probs, "employee(s)")
+        return
+    tiles([("Employees", len(lines), "In this run", BLUE),
+           ("Gross pay", peso(lines["gross"].sum()), "Total", BLUE),
+           ("Deductions", peso((lines["contributions"] + lines["tax"]).sum()), "Contributions and tax", AMBER),
+           ("Net pay", peso(lines["net"].sum()), "To pay out", GREEN)])
+    show_problems(probs, "employee(s) without a rate")
+    section_band("Pay lines")
+    money = {c: "₱{:,.2f}" for c in ("Basic", "Premiums", "Allowances", "Bonus", "Adjustments", "Gross", "SSS",
+                                     "PhilHealth", "Pag-IBIG", "Tax", "Net")}
+    fmt_table(lines, {"emp_id": "Employee ID", "full_name": "Name", "branch_code": "Branch", "basic": "Basic",
+                      "premiums": "Premiums", "allowances": "Allowances", "bonus": "Bonus", "adjustments": "Adjustments",
+                      "gross": "Gross", "sss": "SSS", "philhealth": "PhilHealth", "pagibig": "Pag-IBIG", "tax": "Tax", "net": "Net",
+                      "absences": "Absences", "late_undertime_min": "Late Min"}, dict(money, **{"Late Min": "{:,.0f}"}))
+    flat = lines.drop(columns=["allowance_lines", "bonus_lines", "adjustment_lines"], errors="ignore")
+    c1, c2 = st.columns(2)
+    c1.download_button("Download the pay register (CSV)", flat.to_csv(index=False), "pay_register.csv", "text/csv")
+    payout = lines[["emp_id", "full_name", "net"]].rename(columns={"emp_id": "Employee ID", "full_name": "Name", "net": "Net Pay"})
+    c2.download_button("Download the payout list for the bank (CSV)", payout.to_csv(index=False), "payout_list.csv", "text/csv")
+    st.caption("The payout list has the employee ID, name and net pay only. Match it in the bank's payroll service.")
+    if per["status"] == "Draft":
+        st.subheader("Adjustments")
+        adj = p.adjustments(db, pid)
+        if len(adj):
+            fmt_table(adj, {"username": "Username", "label": "Label", "amount": "Amount", "taxable": "Taxable"}, {"Amount": "₱{:,.2f}"})
+        with st.form("pp_adj"):
+            c1, c2, c3, c4 = st.columns(4)
+            who = c1.selectbox("Employee", list(lines["username"]), key="adj_who")
+            label = c2.text_input("Label", key="adj_label")
+            amt = c3.number_input("Amount (negative to deduct)", step=100.0, key="adj_amt")
+            tax = c4.checkbox("Taxable", value=True, key="adj_tax")
+            add = st.form_submit_button("Add adjustment")
+        if add:
+            try:
+                p.add_adjustment(db, pid, who, label, amt, tax, user["username"])
+                st.success("Adjustment added.")
+            except ValueError as err:
+                st.error(str(err))
+        st.subheader("Finalize")
+        st.write("Check the lines against the current payroll first. Once final, the run cannot change and payslips appear.")
+        sure = st.checkbox("I have checked this run", key="pp_sure")
+        if st.button("Finalize this pay run", key="pp_final", disabled=not sure):
+            try:
+                n = p.finalize_period(db, pid, user["username"])
+                st.success(f"Pay run finalized with {n} payslips.")
+            except ValueError as err:
+                st.error(str(err))
+
+
+def page_rates(user):
+    st.title("Rates and Allowances")
+    emps = h.list_employees(db, with_pay=True, active_only=True)
+    bank_on = h.store_bank_details(db)
+    cols = {"emp_id": "Employee ID", "full_name": "Name", "username": "Username", "branch_code": "Branch",
+            "rate_type": "Rate Type", "rate": "Rate"}
+    if bank_on:
+        cols["bank"] = "Bank Details"
+    fmt_table(emps, cols, {"Rate": "₱{:,.2f}"})
+    if not h.encryption_on():
+        st.warning("SALARY_KEY is not set in the app secrets, so rates are stored without encryption.")
+    if len(emps):
+        with st.form("rate_form"):
+            c1, c2, c3 = st.columns(3)
+            eid = c1.selectbox("Employee", list(emps["emp_id"]), key="rate_emp",
+                               format_func=lambda x: f"{x} {emps.set_index('emp_id').loc[x, 'full_name']}")
+            rt = c2.selectbox("Rate type", list(h.RATE_TYPES), key="rate_type")
+            rate = c3.number_input("Rate (₱ per month or per day)", min_value=0.0, step=500.0, key="rate_amt")
+            bank = st.text_input("Bank details", key="rate_bank") if bank_on else None
+            go = st.form_submit_button("Save rate")
+        if go:
+            try:
+                h.set_pay(db, eid, rt, rate, user["username"], bank)
+                st.success("Rate saved.")
+            except ValueError as err:
+                st.error(str(err))
+    st.download_button("Download the rate template", "Employee ID,Rate Type,Rate\n2026-0001,monthly,26100\n2026-0002,daily,800\n",
+                       "rate_template.csv", "text/csv")
+    up = st.file_uploader("Rates file (.csv or .xlsx)", type=["csv", "xlsx"], key="rate_up")
+    if up is not None and st.button("Load rates", key="rate_load"):
+        try:
+            n, probs = h.bulk_rates(db, read_upload(up), user["username"])
+            st.success(f"{n} rate(s) saved.")
+            show_problems(probs)
+        except ValueError as err:
+            st.error(str(err))
+    st.subheader("Allowances")
+    at = p.allowance_types(db)
+    fmt_table(at.assign(taxable=at["taxable"].map({1: "Yes", 0: "No (up to the ceiling)"})),
+              {"code": "Code", "name": "Allowance", "taxable": "Taxable", "monthly_cap": "Tax-free Ceiling per Month"},
+              {"Tax-free Ceiling per Month": "₱{:,.2f}"})
+    st.caption("De minimis ceilings follow BIR RR 29-2025 (from 6 January 2026). The amount above a ceiling is taxed.")
+    linked = emps[emps["username"].notna()]
+    if len(linked):
+        with st.form("allw_form"):
+            c1, c2, c3 = st.columns(3)
+            who = c1.selectbox("Employee", list(linked["username"]), key="allw_who")
+            code = c2.selectbox("Allowance", list(at["code"]), format_func=lambda x: at.set_index("code").loc[x, "name"], key="allw_code")
+            amt = c3.number_input("Amount per month (0 removes it)", min_value=0.0, step=100.0, key="allw_amt")
+            go = st.form_submit_button("Save allowance")
+        if go:
+            try:
+                p.set_allowance(db, who, code, amt, user["username"])
+                st.success("Allowance saved.")
+            except ValueError as err:
+                st.error(str(err))
+    ea = p.employee_allowances(db)
+    if len(ea):
+        fmt_table(ea, {"username": "Username", "name": "Allowance", "monthly_amount": "Per Month"}, {"Per Month": "₱{:,.2f}"})
+
+
+def page_bonus_rules(user):
+    st.title("Targets and Bonus Rules")
+    branches = branch_list()
+    metrics = ["ALL"] + list(k.get_metrics(db, active_only=True)["metric"])
+    mlabel = lambda m: "Total Adjusted Value" if m == "ALL" else m
+    t1, t2, t3 = st.tabs(["Targets", "Bonus rules", "Achievement"])
+    with t1:
+        with st.form("tg_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            month = c1.text_input("Month (YYYY-MM)", value=a.local_today().strftime("%Y-%m"), key="tg_month")
+            br = c2.selectbox("Branch", list(branches["branch_code"]), key="tg_branch")
+            metric = c3.selectbox("Metric", metrics, format_func=mlabel, key="tg_metric")
+            tg = c4.number_input("Target", min_value=0.0, step=10.0, key="tg_value")
+            go = st.form_submit_button("Save target")
+        if go:
+            try:
+                p.set_target(db, br, metric, month, tg, user["username"])
+                st.success("Target saved.")
+            except ValueError as err:
+                st.error(str(err))
+        t = p.get_targets(db)
+        if len(t):
+            fmt_table(t.assign(metric=t["metric"].map(mlabel)), {"month": "Month", "branch_code": "Branch",
+                                                                 "metric": "Metric", "target": "Target"}, {"Target": "{:,.1f}"})
+    with t2:
+        st.write("For each metric, the highest level a branch reaches decides the bonus for every employee of that branch.")
+        with st.form("br_form"):
+            c1, c2, c3, c4 = st.columns(4)
+            metric = c1.selectbox("Metric", metrics, format_func=mlabel, key="br_metric")
+            pct = c2.number_input("At or above % of target", min_value=1.0, value=100.0, step=5.0, key="br_pct")
+            kind = c3.selectbox("Bonus type", ["fixed", "pct_basic"],
+                                format_func=lambda x: "Fixed amount" if x == "fixed" else "% of basic pay", key="br_kind")
+            val = c4.number_input("Amount or %", min_value=0.0, step=100.0, key="br_val")
+            go = st.form_submit_button("Add rule")
+        if go:
+            try:
+                p.add_bonus_rule(db, metric, pct, kind, val, user["username"])
+                st.success("Rule added.")
+            except ValueError as err:
+                st.error(str(err))
+        r = p.bonus_rules(db)
+        if len(r):
+            fmt_table(r.assign(metric=r["metric"].map(mlabel), kind=r["kind"].map({"fixed": "Fixed", "pct_basic": "% of basic"})),
+                      {"metric": "Metric", "min_pct": "From % of Target", "kind": "Type", "value": "Value"},
+                      {"From % of Target": "{:.0f}%", "Value": "{:,.2f}"})
+            with st.form("br_rm"):
+                rid = st.selectbox("Remove a rule", list(r["id"]), key="br_rm_id",
+                                   format_func=lambda x: f"{mlabel(r.set_index('id').loc[x, 'metric'])} from {r.set_index('id').loc[x, 'min_pct']:.0f}%")
+                rm = st.form_submit_button("Remove rule")
+            if rm:
+                p.remove_bonus_rule(db, rid, user["username"])
+                st.success("Rule removed.")
+    with t3:
+        month = st.text_input("Month (YYYY-MM)", value=a.local_today().strftime("%Y-%m"), key="ach_month")
+        try:
+            ach = p.achievement(db, month, fact())
+        except ValueError as err:
+            st.error(str(err))
+            return
+        if ach.empty:
+            st.info("No targets for this month yet.")
+        else:
+            fmt_table(ach.assign(metric=ach["metric"].map(mlabel)),
+                      {"branch_code": "Branch", "metric": "Metric", "target": "Target", "actual": "Actual", "pct": "% of Target"},
+                      {"Target": "{:,.1f}", "Actual": "{:,.1f}", "% of Target": "{:.0f}%"})
+
+
+def page_thirteenth(user):
+    st.title("13th Month Pay")
+    yr = st.number_input("Year", min_value=2020, max_value=2100, value=a.local_today().year, key="tm_year")
+    t = p.thirteenth_month(db, int(yr))
+    if t.empty:
+        st.info("No final pay runs this year yet.")
+        return
+    fmt_table(t, {"full_name": "Name", "username": "Username", "basic_year": "Basic Pay This Year", "thirteenth_month": "13th Month"},
+              {"Basic Pay This Year": "₱{:,.2f}", "13th Month": "₱{:,.2f}"})
+    st.caption("Basic pay in final pay runs of the year divided by 12. It must be paid by 24 December. "
+               "Up to ₱90,000 of 13th month and other benefits is tax free.")
+    st.download_button("Download as CSV", t.to_csv(index=False), "thirteenth_month.csv", "text/csv")
+
+
+PAY_LABELS = {"days_per_year": "Working days per year (monthly to daily rate)", "hours_per_day": "Hours per day",
+              "days_per_month_daily": "Days per month for daily-paid contributions", "ot_rate": "Overtime rate",
+              "rest_day_rate": "Rest day rate", "regular_holiday_premium": "Regular holiday premium (extra)",
+              "special_day_premium": "Special day premium (extra)", "night_diff": "Night differential (extra)",
+              "sss_rate_ee": "SSS employee rate", "sss_msc_min": "SSS lowest salary credit", "sss_msc_max": "SSS highest salary credit",
+              "phic_rate_ee": "PhilHealth employee rate", "phic_floor": "PhilHealth salary floor",
+              "phic_ceiling": "PhilHealth salary ceiling", "hdmf_rate_ee": "Pag-IBIG employee rate",
+              "hdmf_max_salary": "Pag-IBIG highest fund salary"}
+
+
+def page_pay_settings(user):
+    st.title("Pay Settings")
+    st.warning("These values decide every payslip. The payroll lead must confirm them before go-live and after any change in the law.")
+    s = p.pay_settings(db)
+    with st.form("ps_form"):
+        vals = {}
+        cols = st.columns(2)
+        for i, (key, label) in enumerate(PAY_LABELS.items()):
+            vals[key] = cols[i % 2].number_input(label, value=float(s[key]), key="ps_" + key, format="%.4f")
+        vals["contrib_split"] = st.selectbox("Semi-monthly contributions", ["split", "second"], key="ps_split",
+                                             index=["split", "second"].index(s["contrib_split"]),
+                                             format_func=lambda x: "Half each period" if x == "split" else "All in the second period")
+        go = st.form_submit_button("Save settings")
+    if go:
+        try:
+            p.save_pay_settings(db, vals, user["username"])
+            st.success("Settings saved.")
+        except ValueError as err:
+            st.error(str(err))
+    st.subheader("Withholding tax tables")
+    for freq, rows in p.TAX_TABLES.items():
+        st.write(f"**{freq.title()}**")
+        xl_table(pd.DataFrame(rows, columns=["Over (₱)", "Fixed Tax (₱)", "Rate on Excess"]),
+                 {"Over (₱)": "{:,.0f}", "Fixed Tax (₱)": "{:,.2f}", "Rate on Excess": "{:.0%}"})
+    st.caption("Sources: " + "; ".join(p.PAY_SOURCES) + ".")
+
+
+# ---------------------------------------------------------------- CRM
+CLIENT_TEMPLATE = "Name,Company,Phone,Email,Branch,Source,Notes\nRosa Diaz,Diaz Trading,0917 123 4567,rosa@example.com,Branch01,Walk-in,\n"
+
+
+def contact_form(user, options, key):
+    """Log a contact for one of the given clients (a table with id and name)."""
+    if options.empty:
+        return
+    users = people(branch=scope_branch(user))
+    lab = {r["id"]: f"{r['name']} ({r['status']})" for _, r in options.iterrows()}
+    with st.form(key):
+        c1, c2 = st.columns(2)
+        cid = c1.selectbox("Client", list(lab), format_func=lambda x: lab[x], key=key + "_cid")
+        outcome = c2.selectbox("Outcome", [s for s in c.STATUSES if s != "New"], key=key + "_out")
+        note = st.text_input("Note", key=key + "_note")
+        c3, c4, c5 = st.columns(3)
+        again = c3.checkbox("Call again", key=key + "_again")
+        when = c4.date_input("On", value=a.local_today() + pd.Timedelta(days=3), key=key + "_when")
+        uopts = list(users["username"]) or [user["username"]]
+        who = c5.selectbox("Who will call", uopts, index=uopts.index(user["username"]) if user["username"] in uopts else 0,
+                           format_func=person_label(users), key=key + "_who")
+        go = st.form_submit_button("Save contact")
+    if go:
+        try:
+            warns = c.log_contact(db, cid, user["username"], outcome, note, when if again else None, who if again else None)
+            st.success("Contact saved.")
+            for w in warns:
+                st.warning(w)
+        except ValueError as err:
+            st.error(str(err))
+    hist = c.contacts(db, cid=st.session_state.get(key + "_cid") or list(lab)[0])
+    if len(hist):
+        st.caption("History of this client")
+        fmt_table(hist, {"at": "When", "username": "By", "outcome": "Outcome", "note": "Note"})
+
+
+def page_my_clients(user):
+    st.title("My Clients")
+    me = user["username"]
+    mine = c.clients(db, assigned_to=me)
+    due = c.call_list(db, me, "Pending", a.local_today())
+    tiles([("My clients", len(mine), "Assigned to me", BLUE),
+           ("Open", int((~mine["status"].isin(c.CLOSED)).sum()) if len(mine) else 0, "Not closed", BLUE),
+           ("Call-backs due", len(due), "Today or overdue", AMBER if len(due) else GREEN),
+           ("Closed won", int((mine["status"] == "Closed won").sum()) if len(mine) else 0, "All time", GREEN)])
+    with st.form("cl_add"):
+        st.subheader("Add a client")
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("Name", key="cl_name")
+        comp = c2.text_input("Company", key="cl_comp")
+        src = c3.text_input("Source (walk-in, referral, ad)", key="cl_src")
+        c4, c5 = st.columns(2)
+        phone = c4.text_input("Phone", key="cl_phone")
+        email = c5.text_input("Email", key="cl_email")
+        notes = st.text_input("Notes", key="cl_notes")
+        go = st.form_submit_button("Add client")
+    if go:
+        try:
+            c.add_client(db, me, name, comp, phone, email, user["branch_code"], src, notes, assigned_to=me)
+            st.success("Client added and assigned to you.")
+        except ValueError as err:
+            st.error(str(err))
+    status = st.selectbox("Show", ["Open", "All"] + list(c.STATUSES), key="cl_filter")
+    view = mine if status == "All" else (mine[~mine["status"].isin(c.CLOSED)] if status == "Open" else mine[mine["status"] == status])
+    section_band("My clients")
+    if view.empty:
+        st.write("No clients here.")
+    else:
+        fmt_table(view, {"name": "Name", "company": "Company", "phone": "Phone", "email": "Email", "status": "Status",
+                         "last_contact_at": "Last Contact", "last_contact_by": "By", "next_call_on": "Call Again On"})
+        st.subheader("Log a contact")
+        contact_form(user, view, "mc_contact")
+
+
+def page_call_list(user):
+    st.title("Call List")
+    br = scope_branch(user) if user["role"] in ("supervisor", "branch", "employee") else None
+    sees_all = user["role"] in ("supervisor", "manager", "owner")
+    who = None if sees_all and st.checkbox("Show everyone's call-backs", key="call_all") else user["username"]
+    calls = c.call_list(db, who, "Pending", branch_code=br if who is None else None)
+    today = str(a.local_today())
+    due = calls[calls["call_on"] <= today] if len(calls) else calls
+    tiles([("Pending call-backs", len(calls), "In this list", BLUE),
+           ("Due", len(due), "Today or overdue", AMBER if len(due) else GREEN)])
+    section_band("Who calls which client, when")
+    if calls.empty:
+        st.write("No pending call-backs.")
+        return
+    calls = calls.assign(when=["Overdue" if d < today else ("Today" if d == today else "Later") for d in calls["call_on"]])
+    fmt_table(calls, {"call_on": "Call On", "when": "When", "client": "Client", "company": "Company", "phone": "Phone",
+                      "assigned_name": "Caller", "client_status": "Client Status", "created_by": "Set By"})
+    mine = calls[calls["assigned_to"] == user["username"]]
+    if len(mine):
+        st.subheader("Log a call")
+        contact_form(user, c.clients(db)[lambda d: d["id"].isin(mine["client_id"])], "cl_contact")
+    if sees_all:
+        users = people(branch=br)
+        with st.form("call_re"):
+            c1, c2 = st.columns(2)
+            cid = c1.selectbox("Call-back", list(calls["id"]), key="re_call",
+                               format_func=lambda x: f"{calls.set_index('id').loc[x, 'client']} on {calls.set_index('id').loc[x, 'call_on']}")
+            to = c2.selectbox("Give to", list(users["username"]), format_func=person_label(users), key="re_to")
+            go = st.form_submit_button("Reassign")
+        if go:
+            try:
+                c.reassign_call(db, cid, to, user["username"])
+                st.success("Call-back reassigned.")
+            except ValueError as err:
+                st.error(str(err))
+
+
+def page_all_clients(user):
+    st.title("All Clients")
+    br = scope_branch(user)
+    branches = branch_list()
+    c1, c2, c3 = st.columns(3)
+    pick = br or c1.selectbox("Branch", ["All branches"] + list(branches["branch_code"]), key="ac_branch")
+    status = c2.selectbox("Status", ["All"] + list(c.STATUSES), key="ac_status")
+    search = c3.text_input("Search name, company, phone or email", key="ac_search")
+    df = c.clients(db, branch_code=None if pick == "All branches" else pick, status=None if status == "All" else status, search=search)
+    counts = df.groupby("status", as_index=False).size().rename(columns={"size": "clients"}) if len(df) else None
+    tiles([("Clients", len(df), "In this view", BLUE),
+           ("Untouched", int(((df["status"] == "New") & df["last_contact_at"].isna()).sum()) if len(df) else 0, "Never contacted", AMBER),
+           ("Closed won", int((df["status"] == "Closed won").sum()) if len(df) else 0, "In this view", GREEN)])
+    if counts is not None:
+        with panel("ac_status", "Clients by Status"):
+            hbar(counts, "status", "clients", "Status", "Clients")
+    section_band("Clients")
+    if len(df):
+        fmt_table(df, {"name": "Name", "company": "Company", "phone": "Phone", "email": "Email", "branch_code": "Branch",
+                       "status": "Status", "assigned_name": "Assigned To", "last_contact_at": "Last Contact",
+                       "next_call_on": "Call Again On", "source": "Source"})
+        st.download_button("Download as CSV", df.to_csv(index=False), "clients.csv", "text/csv")
+    st.subheader("Upload clients")
+    st.download_button("Download the client template", CLIENT_TEMPLATE, "client_template.csv", "text/csv")
+    up = st.file_uploader("Client list (.csv or .xlsx)", type=["csv", "xlsx"], key="ac_up")
+    if up is not None and st.button("Load clients", key="ac_load"):
+        try:
+            n, skipped = c.bulk_clients(db, read_upload(up), user["username"], default_branch=br)
+            st.success(f"{n} client(s) added. Duplicates are skipped.")
+            show_problems(skipped)
+        except ValueError as err:
+            st.error(str(err))
+
+
+def page_assign_clients(user):
+    st.title("Assign Clients")
+    br = scope_branch(user)
+    branches = branch_list()
+    pick = br or st.selectbox("Branch", ["All branches"] + list(branches["branch_code"]), key="as_branch")
+    branch = None if pick == "All branches" else pick
+    inc = st.checkbox("Include untouched clients already assigned (reshuffle them)", key="as_inc")
+    pool = c.untouched(db, branch, inc)
+    tiles([("Untouched clients", len(pool), "New, never contacted", AMBER if len(pool) else GREEN)])
+    users = people(role_filter=["employee", "branch", "supervisor"], branch=branch)
+    if users.empty:
+        st.info("No employees in this branch to assign to.")
+        return
+    chosen = st.multiselect("Share them out among", list(users["username"]), format_func=person_label(users), key="as_people")
+    if st.button("Assign at random", key="as_go", type="primary", disabled=not chosen or pool.empty):
+        try:
+            counts = c.assign_random(db, chosen, user["username"], branch_code=branch, include_assigned=inc)
+            st.success("Assigned: " + ", ".join(f"{u} {n}" for u, n in counts.items()))
+        except ValueError as err:
+            st.error(str(err))
+    st.caption("Clients are shuffled and dealt out in turn, so everyone gets the same number, give or take one. "
+               "Each person gets a notification.")
+
+
+def page_crm_report(user):
+    today = a.local_today()
+    br = scope_branch(user)
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", value=today.replace(day=1), key="cr_from")
+    end = c2.date_input("To", value=today, key="cr_to")
+    title_band("CRM Report", f"{start:%d %b %Y} to {end:%d %b %Y}" + (f" &nbsp;|&nbsp; {br}" if br else ""))
+    con = c.contacts(db, start=start, end=end)
+    if br:
+        con = con[con["branch_code"] == br]
+    won = con[con["outcome"] == "Closed won"]
+    tiles([("Contacts", len(con), "In the period", BLUE), ("Clients reached", con["client_id"].nunique() if len(con) else 0, "Different clients", BLUE),
+           ("Closed won", len(won), "In the period", GREEN), ("People active", con["username"].nunique() if len(con) else 0, "Made a contact", BLUE)])
+    if len(con):
+        g1, g2 = st.columns(2)
+        with g1, panel("cr_people", "Contacts by Person"):
+            hbar(con.groupby("username", as_index=False).size().rename(columns={"size": "contacts"}), "username", "contacts", "Person", "Contacts")
+        with g2, panel("cr_branch", "Contacts by Branch"):
+            hbar(con.groupby("branch_code", as_index=False).size().rename(columns={"size": "contacts"}), "branch_code", "contacts", "Branch", "Contacts")
+    link = c.kpi_link(db)
+    section_band("Link to Branch KPI")
+    if user["role"] == "owner":
+        metrics = ["(not linked)"] + list(k.get_metrics(db, active_only=True)["metric"])
+        with st.form("cr_link"):
+            c1, c2, c3 = st.columns(3)
+            m = c1.selectbox("Branch KPI metric", metrics, index=metrics.index(link["metric"]) if link["metric"] in metrics else 0, key="cr_metric")
+            cnt = c2.selectbox("Count", ["contacts", "closed_won"], index=["contacts", "closed_won"].index(link["count"]),
+                               format_func=lambda x: "Every contact" if x == "contacts" else "Closed won only", key="cr_count")
+            mode = c3.selectbox("Use", ["validate", "fill"], index=["validate", "fill"].index(link["mode"]),
+                                format_func=lambda x: "Check what branches type" if x == "validate" else "Fill the entries", key="cr_mode")
+            go = st.form_submit_button("Save link")
+        if go:
+            try:
+                c.set_kpi_link(db, None if m == "(not linked)" else m, cnt, mode, user["username"])
+                st.success("Link saved.")
+                link = c.kpi_link(db)
+            except ValueError as err:
+                st.error(str(err))
+    if not link["metric"]:
+        st.write("No Branch KPI metric is linked yet." + (" The owner sets the link here." if user["role"] != "owner" else ""))
+        return
+    st.write(f"Linked metric: **{link['metric']}**, counting {'every contact' if link['count'] == 'contacts' else 'closed won only'}.")
+    if link["mode"] == "validate":
+        v = c.validation(db, start, end)
+        if br:
+            v = v[v["branch_code"] == br]
+        fmt_table(v, {"date": "Date", "branch_code": "Branch", "value": "Entered in Branch KPI", "crm_count": "CRM Count",
+                      "difference": "Difference", "check": "Check"}, {"Entered in Branch KPI": "{:,.0f}", "Difference": "{:+,.0f}"})
+    elif user["role"] in ("owner", "manager"):
+        over = st.checkbox("Overwrite values branches already typed", key="cr_over")
+        if st.button("Fill Branch KPI from the CRM for these dates", key="cr_fill"):
+            n = c.fill_kpi(db, start, end, user["username"], over)
+            refresh_data()
+            st.success(f"{n} entries written to {link['metric']}.")
+    month = st.text_input("Branch achievement for month (YYYY-MM)", value=today.strftime("%Y-%m"), key="cr_month")
+    try:
+        ba = c.branch_achievement(db, month)
+        if br:
+            ba = ba[ba["branch_code"] == br]
+        fmt_table(ba, {"rank": "Rank", "branch": "Branch", "crm_count": "CRM Count", "target": "Target", "pct": "% of Target"},
+                  {"Target": "{:,.0f}", "% of Target": "{:.0f}%"})
+    except ValueError as err:
+        st.error(str(err))
+
+
 PAGE_FUNCS = {
     "Home": page_home, "My Attendance": page_my_attendance, "Attendance Today": page_attendance_today,
     "Attendance Report": page_attendance_report, "Corrections": page_corrections,
@@ -1111,6 +2100,12 @@ PAGE_FUNCS = {
     "Submission Check": page_submission_check, "Data Quality": page_data_quality,
     "Users": page_users, "Admin": page_admin, "My Account": page_my_account,
     "My Cluster": page_my_cluster, "Quarter Ranking": page_quarter_ranking,
+    "My Payslips": page_my_payslips, "My Requests": page_my_requests, "Approvals": page_approvals,
+    "Employees": page_employees, "Schedules": page_schedules, "Leave and Holidays": page_leave_setup,
+    "Pay Runs": page_pay_runs, "Rates and Allowances": page_rates, "Targets and Bonus Rules": page_bonus_rules,
+    "13th Month": page_thirteenth, "Pay Settings": page_pay_settings,
+    "My Clients": page_my_clients, "Call List": page_call_list, "All Clients": page_all_clients,
+    "Assign Clients": page_assign_clients, "CRM Report": page_crm_report,
 }
 
 

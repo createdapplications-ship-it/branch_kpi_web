@@ -1,3 +1,62 @@
+# Company Portal
+
+One app, one database, one account per person. Sections: Home, Attendance, Branch KPI, HR, Payroll and CRM.
+Each person sees only the sections their role allows.
+
+## Roles
+
+| Role | What they can do |
+|---|---|
+| employee | Time in and out, requests (corrections, overtime, leave), own payslips, own CRM clients |
+| branch | Employee, plus Branch KPI daily entry, My Branch and My Cluster |
+| supervisor | Branch, plus approving the branch's requests, branch attendance, branch CRM and random assignment |
+| hr | Employees, schedules, leave and holidays, approvals, attendance reports. No salary |
+| payroll | Pay runs, rates and allowances, targets and bonus rules, 13th month, pay settings |
+| manager | Dashboards and reports for all branches, approvals, CRM for all branches |
+| owner | Everything, including Users and Admin |
+
+## New secrets
+
+- `SALARY_KEY`: any long random text. It encrypts salaries, bank details (if stored) and final pay lines.
+  Set it before loading real salaries. Keep a copy somewhere safe: without it, encrypted pay data cannot be read.
+  Never change it after salaries are loaded.
+
+## HR
+
+- Employees: permanent employee IDs (for example 2026-0001), linked to a portal account. Bulk upload from a template.
+- Bank details are off by default. The owner can turn them on in Admin. Off means account numbers stay with the bank,
+  and payroll uses the payout list (employee ID, name, net pay).
+- Schedules: upload one row per person per day, or a weekly pattern with From and To dates.
+- Leave: types, yearly balances, requests and approvals. Holiday calendar: regular and special days.
+
+## Attendance
+
+- Correction and overtime requests go to the branch supervisor, HR, a manager or the owner. An approved correction
+  changes the attendance record. Approved overtime is paid.
+- The Attendance Report works out Present, Late, Undertime, Absent, On leave, Rest day and Holiday from the schedule.
+
+## Payroll
+
+- Basic pay from the rate (monthly or daily) and attendance; overtime, night differential, rest day and holiday premiums;
+  allowances (de minimis amounts are tax free up to their ceilings); bonuses from Branch KPI actuals against targets;
+  adjustments; SSS, PhilHealth and Pag-IBIG employee shares; withholding tax (2023 onward table).
+- Every value is a setting on the Pay Settings page. The payroll lead must confirm them before go-live.
+- Not covered yet: minimum wage earner exemption, the 90,000 ceiling on 13th month and other benefits, loans,
+  year-end annualization. Use adjustments for these until they are added.
+
+## CRM
+
+- Clients with a status; a call-back table (who calls which client, when); bulk upload; random, even assignment of
+  untouched clients; notifications on the Home page.
+- Link to Branch KPI (owner, on the CRM Report page): count contacts or closed sales per branch per day for one metric,
+  then either check what branches typed, or fill the entries. Branch achievement compares the count with the target.
+
+## Checks
+
+`python test_logic.py`, `python test_att.py`, `python test_hr.py`, `python test_payroll.py`, `python test_crm.py`.
+
+---
+
 # Company Portal: Attendance and Branch KPI in one app
 
 One app, one database, one account per person.

@@ -28,6 +28,11 @@ raises("the branch role still needs a branch", lambda: k.create_user(db, "nb", "
 raises("a branch that does not exist is refused", lambda: k.create_user(db, "nb", "X", "employee", "Branch99", "Abcd1234", by="owner"))
 raises("an unknown role is refused", lambda: k.create_user(db, "nb", "X", "staff", None, "Abcd1234", by="owner"))
 
+k.set_role(db, "juan", "branch", "Branch02", "owner")
+ok("the owner can change a role and branch", k.check_login(db, "juan", "Abcd1234")["role"] == "branch" and k.check_login(db, "juan", "Abcd1234")["branch_code"] == "Branch02")
+raises("changing to the branch role needs a branch", lambda: k.set_role(db, "maria", "branch", None, "owner"))
+raises("the last owner cannot be changed to another role", lambda: k.set_role(db, "owner", "manager", None, "owner"))
+k.set_role(db, "juan", "employee", "Branch01", "owner")
 # 65 users from a file
 rows = [{"Username": f"emp{i:02d}", "Full Name": f"Employee {i:02d}", "Role": "employee", "Branch": f"Branch{(i % 20) + 1:02d}"} for i in range(1, 61)]
 rows += [{"Username": f"mgr{i}", "Full Name": f"Manager {i}", "Role": "manager", "Branch": ""} for i in range(1, 6)]

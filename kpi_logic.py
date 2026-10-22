@@ -22,8 +22,9 @@ import pandas as pd
 BASE = Path(__file__).parent
 DATA_DIR = BASE / "data"
 SQLITE_PATH = Path(os.environ.get("KPI_DB", BASE / "kpi.db"))
-ROLES = ("employee", "branch", "manager", "owner")
-ROLE_CHECK = "role IN ('employee','branch','manager','owner')"
+ROLES = ("employee", "branch", "supervisor", "hr", "payroll", "manager", "owner")
+ROLE_CHECK = "role IN ('employee','branch','supervisor','hr','payroll','manager','owner')"
+BRANCH_ROLES = ("branch", "supervisor")   # roles that must belong to a branch
 MIN_PASSWORD = 8
 HASH_ROUNDS = 200_000
 SESSION_HOURS = 12
@@ -170,13 +171,13 @@ def ensure_column(db, table, column, definition):
 
 
 def migrate_roles(db):
-    """Older databases allow three roles only. Allow the employee role (Attendance only) as well."""
+    """Older databases allow fewer roles. Allow every role in ROLES."""
     if db.is_pg:
         db.run([("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check", ()),
                 (f"ALTER TABLE users ADD CONSTRAINT users_role_check CHECK ({ROLE_CHECK})", ())])
         return
     made = db.one("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")[0]
-    if "'employee'" in made:
+    if "'payroll'" in made:
         return
     create = [x for x in schema(False) if "TABLE IF NOT EXISTS users" in x][0]
     cols = "username, full_name, password_hash, salt, role, branch_code, must_change, active, created_at"
@@ -233,8 +234,8 @@ def create_user(db, username, full_name, role, branch_code, password, by, must_c
         raise ValueError("Username: 3 to 40 characters, letters, numbers, dot, dash or underscore.")
     if role not in ROLES:
         raise ValueError("Unknown role.")
-    if role == "branch" and not branch_code:
-        raise ValueError("A branch user needs a branch.")
+    if role in BRANCH_ROLES and not branch_code:
+        raise ValueError(f"A {role} user needs a branch.")
     branch_code = (branch_code or "").strip() or None
     if branch_code and not db.one("SELECT COUNT(*) FROM branches WHERE branch_code = ?", (branch_code,))[0]:
         raise ValueError(f"{branch_code} is not in the branch list.")
@@ -315,8 +316,8 @@ def set_role(db, username, role, branch_code, by):
     if not row:
         raise ValueError("User not found.")
     branch_code = (branch_code or "").strip() or None
-    if role == "branch" and not branch_code:
-        raise ValueError("A branch user needs a branch.")
+    if role in BRANCH_ROLES and not branch_code:
+        raise ValueError(f"A {role} user needs a branch.")
     if branch_code and not db.one("SELECT COUNT(*) FROM branches WHERE branch_code = ?", (branch_code,))[0]:
         raise ValueError(f"{branch_code} is not in the branch list.")
     owners = db.one("SELECT COUNT(*) FROM users WHERE role = 'owner' AND active = 1")[0]
