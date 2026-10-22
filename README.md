@@ -3,6 +3,13 @@
 One app, one database, one account per person. Sections: Home, Attendance, Branch KPI, HR, Payroll and CRM.
 Each person sees only the sections their role allows.
 
+## Main page and menu
+- The main page shows a card for every module: Attendance, Branch KPI, HR, Payroll and CRM. No sign-in is needed to see it.
+- Any card leads to the sign-in page. After sign-in, the role decides access. A module the role cannot use shows "Your account does not have access".
+- The menu bar lists only the modules the person can open, in a smaller font.
+- Each module has its own colour: Attendance teal, Branch KPI blue, HR purple, Payroll green, CRM brown. The colour shows on the card, the menu mark, the title band and the breadcrumb.
+- Colours and card text are in the MODULES list at the top of app.py.
+
 ## Roles
 
 | Role | What they can do |

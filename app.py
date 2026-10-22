@@ -40,7 +40,8 @@ div[class*="st-key-menu_card"] .brand .dot {{width: .8rem; height: .8rem; border
 div[class*="st-key-menu_card"] button, div[class*="st-key-menu_card"] button p,
 div[class*="st-key-menu_card"] button svg {{color: #FFFFFF !important; fill: #FFFFFF;}}
 div[class*="st-key-menu_card"] button {{border: none !important; background: transparent !important;
-    font-size: .95rem; padding: .3rem .5rem; min-height: 2.2rem;}}
+    font-size: .85rem; padding: .2rem .45rem; min-height: 1.9rem;}}
+div[class*="st-key-menu_card"] button p {{font-size: .85rem;}}
 div[class*="st-key-menu_card"] button:hover {{background: rgba(255,255,255,.12) !important;}}
 div[data-testid="stPopoverBody"] {{min-width: 13rem; padding: .6rem .7rem;}}
 div[data-testid="stPopoverBody"] [data-testid="stVerticalBlock"] {{gap: .1rem;}}
@@ -100,6 +101,30 @@ os.environ["SALARY_KEY"] = cfg("SALARY_KEY", "") or ""
 db, HAS_OWNER = get_db()
 a.TZ_NAME = cfg("APP_TIMEZONE", a.TZ_NAME)
 PORTAL_NAME = cfg("PORTAL_NAME", "Company Portal")
+
+# Every module of the portal: shown as a card on the main page and in the menu bar. Each has its own colour.
+MODULES = [
+    ("Attendance", "Time in and out, schedules, correction and overtime requests, and leave.", "#1C7C8C"),
+    ("Branch KPI", "Daily branch entries, rankings, clusters and dashboards.", "#0F6CBD"),
+    ("HR", "Employee records, schedules, leave balances and holidays.", "#7A5AA6"),
+    ("Payroll", "Pay runs from attendance, bonuses from targets, payslips and 13th month.", "#2E8B57"),
+    ("CRM", "Clients, call-backs, assignments and the link to Branch KPI.", "#B5651D"),
+]
+MOD_COLOUR = {"Home": "#1F2A44", **{m[0]: m[2] for m in MODULES}}
+CUR = {"colour": "#1F2A44"}   # colour of the section that is open
+
+
+def _key(name):
+    return name.replace(" ", "_")
+
+
+st.markdown("<style>" + "".join(
+    f'''div[class*="st-key-card_mod_{_key(n)}"] {{border-top: 6px solid {col} !important;}}
+div[class*="st-key-card_mod_{_key(n)}"] h3 {{color: {col};}}
+div[class*="st-key-card_mod_{_key(n)}"] button[kind="primary"] {{background: {col}; border-color: {col};}}
+div[class*="st-key-navsec_{_key(n)}"] button p::before {{content: ""; display: inline-block; width: .55rem; height: .55rem;
+    border-radius: 2px; background: {col}; margin-right: .45rem; vertical-align: .05rem; filter: brightness(1.35);}}
+''' for n, _, col in MODULES) + "</style>", unsafe_allow_html=True)
 
 # Data is kept in memory for a short time so each click does not reload every entry from the database.
 # It is cleared straight after any save, import or reference change.
@@ -215,25 +240,35 @@ def choose(section):
     st.session_state["dest"] = section
 
 
+def module_cards(prefix, secs=None, on_click=choose):
+    """One card per module. secs=None (not signed in): every card opens the sign-in page.
+    With secs, a module the person cannot open says so instead of showing a button."""
+    rows = [MODULES[:3], MODULES[3:]]
+    for r, row in enumerate(rows):
+        cols = st.columns(3)
+        for col, (name, text, _) in zip(cols, row):
+            with col, card(f"mod_{_key(name)}_{prefix}"):
+                st.subheader(name)
+                st.write(text)
+                if secs is None or name in secs:
+                    st.button(f"Open {name}", key=f"{prefix}_open_{_key(name)}", type="primary",
+                              on_click=on_click, args=(name,))
+                else:
+                    st.caption("Your account does not have access. Ask the owner if you need it.")
+
+
 def landing_page():
-    """The open main page. No sign-in here. Each link leads to the sign-in page."""
+    """The open main page. No sign-in here. Each card leads to the sign-in page; access is checked after it."""
     st.title(PORTAL_NAME)
-    st.caption("Choose where to go. You sign in with your own username and password.")
-    c1, c2 = st.columns(2)
-    with c1, card("land_att"):
-        st.subheader("Attendance")
-        st.write("Time in and time out each day, and see your own attendance record for the month.")
-        st.button("Open Attendance", key="open_att", type="primary", on_click=choose, args=("Attendance",))
-    with c2, card("land_kpi"):
-        st.subheader("Branch KPI")
-        st.write("Enter the daily values for your branch, and view the rankings, clusters and dashboards.")
-        st.button("Open Branch KPI", key="open_kpi", type="primary", on_click=choose, args=("Branch KPI",))
+    st.caption("Choose where to go. You sign in with your own username and password. "
+               "Each person sees the modules their role allows.")
+    module_cards("land")
 
 
 def login_page():
     dest = st.session_state.get("dest", "Home")
     st.title(f"{dest}: sign in" if dest != "Home" else "Sign in")
-    st.caption("One account works for both Attendance and Branch KPI.")
+    st.caption("One account works for every module.")
     with st.form("login"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -437,9 +472,10 @@ BLUE, GREY, GREEN, AMBER, RED, NAVY = "#0F6CBD", "#9AA5B1", "#2E8B57", "#D9822B"
 CLUSTER_COLOURS = ["#0F6CBD", "#2E8B57", "#D9822B", "#7A5AA6", "#3AA6B9", "#9AA5B1"]
 
 
-def title_band(title, subtitle):
-    st.markdown(f'<div class="band"><div class="band-t">{title}</div><div class="band-s">{subtitle}</div></div>',
-                unsafe_allow_html=True)
+def title_band(title, subtitle, colour=None):
+    """The page's title band, in the colour of the module that is open."""
+    st.markdown(f'<div class="band" style="background:{colour or CUR["colour"]}"><div class="band-t">{title}</div>'
+                f'<div class="band-s">{subtitle}</div></div>', unsafe_allow_html=True)
 
 
 def section_band(text, colour=NAVY):
@@ -976,22 +1012,10 @@ def page_my_account(user):
 # ---------------------------------------------------------------- home and attendance
 def page_home(user):
     st.title(PORTAL_NAME)
-    st.write(f"Signed in as **{user['full_name']}**.")
-    secs = sections_for(user["role"])
-    c1, c2 = st.columns(2)
-    with c1, card("home_att"):
-        st.subheader("Attendance")
-        state, rec = a.status(db, user["username"])
-        st.write({"in": "You are timed in.", "out": "You are not timed in.",
-                  "no_time_out": "An earlier time in was never closed."}[state])
-        st.button("Open Attendance", key="home_att", type="primary", on_click=go_to, args=("Attendance",))
-    with c2, card("home_kpi"):
-        st.subheader("Branch KPI")
-        if "Branch KPI" in secs:
-            st.write("Enter daily values and view the rankings and dashboards.")
-            st.button("Open Branch KPI", key="home_kpi", type="primary", on_click=go_to, args=("Branch KPI",))
-        else:
-            st.write("Your account does not have Branch KPI access. Ask the owner if you need it.")
+    state, rec = a.status(db, user["username"])
+    st.write(f"Signed in as **{user['full_name']}**. " + {"in": "You are timed in.", "out": "You are not timed in.",
+             "no_time_out": "An earlier time in was never closed."}[state])
+    module_cards("home", sections_for(user["role"]), on_click=go_to)
     c3, c4 = st.columns(2)
     with c3:
         notifications_card(user)
@@ -2135,6 +2159,11 @@ def main():
         password_form(user, forced=True)
         return
     secs = sections_for(user["role"])
+    asked = (st.session_state.get("nav") or (st.session_state.get("dest"),))[0]
+    denied = asked if asked not in (None, "Home", *secs) else None
+    if denied:
+        st.session_state.pop("dest", None)
+        st.session_state.pop("nav", None)
     # The open page is kept in the address too, so a refresh returns to the same page.
     section, page = st.session_state.get("nav") or (
         st.query_params.get("sec") or st.session_state.get("dest"), st.query_params.get("pg"))
@@ -2143,13 +2172,14 @@ def main():
     if page not in secs[section]:
         page = secs[section][0]
     st.session_state["nav"] = (section, page)
+    CUR["colour"] = MOD_COLOUR.get(section, "#1F2A44")
     if st.query_params.get("pg") != page or st.query_params.get("sec") != section:
         st.query_params["sec"] = section
         st.query_params["pg"] = page
     with st.container(key="menu_card"):
-        menus = [n for n in secs if n != "Home"]
+        menus = [m[0] for m in MODULES if m[0] in secs]
         nn = st.session_state.get("nav_n", 0)
-        cols = st.columns([2.6, 0.8] + [1.4] * len(menus) + [max(0.5, 5.4 - 1.4 * len(menus)), 2.0],
+        cols = st.columns([2.2, 0.7] + [1.15] * len(menus) + [max(0.3, 6.0 - 1.15 * len(menus)), 1.8],
                           vertical_alignment="center")
         cols[0].markdown(f'<div class="brand"><span class="dot"></span>{PORTAL_NAME}</div>', unsafe_allow_html=True)
         with cols[1].container(key="navsec_Home"):
@@ -2170,7 +2200,9 @@ def main():
         ["Home", page] if section == "Home" else ["Home", section, page])
     st.markdown(
         f'<style>div[class*="st-key-navsec_{section.replace(" ", "_")}"] button {{'
-        'border-bottom: 3px solid #5BB0F0 !important; border-radius: 0 !important;}</style>'
+        f'border-bottom: 3px solid {MOD_COLOUR.get(section, "#5BB0F0") if section != "Home" else "#5BB0F0"} !important; '
+        'border-radius: 0 !important; background: rgba(255,255,255,.10) !important;}</style>'
+        f'<style>.crumb {{border-left: 6px solid {CUR["colour"]};}}</style>'
         '<div class="crumb">' + '<i>/</i>'.join(
             f"<b>{t}</b>" if i == len(trail) - 1 else f"<span>{t}</span>" for i, t in enumerate(trail)) + "</div>",
         unsafe_allow_html=True)
@@ -2183,6 +2215,8 @@ def main():
             st.session_state.pop("nav", None)
             st.query_params.clear()
             st.rerun()
+    if denied:
+        st.warning(f"Your account does not have {denied} access. Ask the owner if you need it.")
     PAGE_FUNCS[page](user)
     st.caption(f"You stay signed in for {k.SESSION_HOURS} hours, or until you sign out. "
                "Do not share the page address while signed in.")
